@@ -56,6 +56,7 @@ use crate::plugin_audio_effect::PluginAudioEffect;
 use crate::plugin_instrument::PluginInstrument;
 use crate::plugin_midi_effect::PluginMidiEffect;
 use crate::composite::CompositeBinding;
+use crate::effect_composite::EffectCompositeBinding;
 use crate::audio_region_player::AudioRegionPlayer;
 use crate::midi_output::{self, CcBinding, MidiOutControls, MidiOutProcessor};
 use crate::time_stretch::{TimeStretchConfig, TransientPlayMode};
@@ -65,15 +66,15 @@ use crate::{call_device_init, call_device_field_changed, call_device_parameter_c
 mod wiring;
 mod routing;
 mod tracks;
-mod params;
+pub(crate) mod params;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use tracks::{AudioRegion, BoundAudioClip, BoundNoteTracks, SharedAudioTrackSets, SharedTrackSets,
+pub(crate) use tracks::{AudioRegion, SignalsmithConfig, BoundAudioClip, BoundNoteTracks, SharedAudioTrackSets, SharedTrackSets,
     TrackBinding, AudioTrackBinding, CollectionCache, reconcile_tracks, teardown_track, teardown_audio_track};
-pub(crate) use params::{resolve_and_deliver_sample, NoteSignal, refresh_params, set_params_signal,
+pub(crate) use params::{resolve_and_deliver_sample, NoteSignal, set_params_signal,
     params_invalidate, automation_invalidate};
-pub(crate) use wiring::{device_label, tape_region_counts};
+pub(crate) use wiring::tape_region_counts;
 // Re-exported ONLY for the sibling test module's `super::` (whitebox) paths; not used by the non-test build.
 #[cfg(test)]
 pub(crate) use tracks::TRACK_CLIPS_KEY;
@@ -239,15 +240,14 @@ impl Wired {
 pub(crate) struct BusWired {
     pub(crate) bus_uuid: Uuid, // the AudioBusBox uuid; its sum node + `bus_registry` entry are dropped on teardown
     pub(crate) sum_buffer: SharedAudioBuffer, // the RAW sum (pre-fx), the `useInstrumentOutput` stem tap
+    pub(crate) sum_node: Option<NodeId>, // this bus's own sum; `None` for the output unit (the shared master is never removed)
     pub(crate) pre_strip: SharedAudioBuffer, // the fx-chain output feeding the strip (the send tap)
     pub(crate) pre_strip_node: NodeId,
     pub(crate) strip_id: NodeId,
     pub(crate) strip_output: SharedAudioBuffer,
-    pub(crate) nodes: Vec<NodeId>,           // sum + fx nodes + strip (removed on teardown)
+    pub(crate) audio: Vec<Member>,           // the bus's AUDIO-effects chain (sum -> fx0 -> ... -> strip), like a leaf
     pub(crate) edges: Vec<(NodeId, NodeId)>, // sum -> fx0 -> ... -> strip
-    pub(crate) device_params: Vec<DeviceParams>,
-    pub(crate) sidechains: Vec<SidechainBinding>, // a sidechained bus effect (e.g. a ducking compressor) resolved each pass
-    pub(crate) subs: Vec<SubscriptionId>     // the bus `enabled` monitor + each fx device's `enabled` monitor
+    pub(crate) subs: Vec<SubscriptionId>     // the bus `enabled` monitor
 }
 
 /// A unit's currently-wired OUTPUT route: which target bus sum its channel strip feeds. `bus` is the target
@@ -285,14 +285,14 @@ pub(crate) struct TapeWired {
     pub(crate) enabled_sub: SubscriptionId, // TapeDeviceBox `enabled` (4): gates the player, resets on disable (TS mirror)
     pub(crate) player_id: NodeId,
     pub(crate) instrument_uuid: Uuid,        // the TapeDeviceBox uuid: the player output is registered under it so a SIDECHAIN
-                                  // targeting the tape device taps its RAW output (pre fx / strip), matching TS
+                                  // targeting the tape device taps its output — which now includes the monitored
+                                  // live input (the player sums it in), so an armed tape drives such a side-chain
     pub(crate) audio: Vec<Member>,           // the unit's AUDIO-effects chain (player -> fx0 -> ... -> strip), like a leaf
     pub(crate) pre_strip: SharedAudioBuffer, // the fx-chain output feeding the strip (the send tap; == player output if no fx)
     pub(crate) pre_strip_node: NodeId,
     pub(crate) strip_id: NodeId,
     pub(crate) strip_output: SharedAudioBuffer,
-    pub(crate) edges: Vec<(NodeId, NodeId)>, // player -> fx0 -> ... -> strip
-    pub(crate) monitor_node: Option<NodeId>  // the EFFECTS-monitoring injector, rebuilt per re-wire
+    pub(crate) edges: Vec<(NodeId, NodeId)>  // player -> fx0 -> ... -> strip
 }
 
 /// A held device processor, kept alive across rewires so its DSP state (voices, delay tails, filter history)
@@ -301,7 +301,11 @@ pub(crate) struct TapeWired {
 pub(crate) enum ProcHandle {
     Instrument(Rc<RefCell<PluginInstrument>>),
     Audio(Rc<RefCell<PluginAudioEffect>>),
-    Midi(Rc<PluginMidiEffect>)
+    Midi(Rc<PluginMidiEffect>),
+    // A parallel EFFECT COMPOSITE: not one plugin but a whole sub-graph (distributor -> entries -> wet sum ->
+    // dry/wet mix) the engine owns itself. It sits in an audio chain like any other member — see `Member`'s
+    // `input_node` for how the chain wires through it.
+    EffectComposite(Box<EffectCompositeBinding>)
 }
 
 /// One persistent chain member: its device box uuid, the held processor, its graph node (none for a midi-fx,
@@ -311,9 +315,17 @@ pub(crate) enum ProcHandle {
 pub(crate) struct Member {
     pub(crate) uuid: Uuid,
     pub(crate) proc: ProcHandle,
+    // The chain's EXIT node for this member: what the next member reads / edges from. For a plugin it is the
+    // plugin's node; for an effect composite it is the dry/wet mix at the composite's end.
     pub(crate) node_id: Option<NodeId>,
+    // The chain's ENTRY node: what the PREVIOUS member edges INTO. `None` means "same as `node_id`", which is
+    // every plugin. An effect composite differs: the upstream feeds its DISTRIBUTOR while its exit is the mix,
+    // so the chain wires `prev -> input_node` and continues from `node_id`.
+    pub(crate) input_node: Option<NodeId>,
     pub(crate) output: Option<SharedAudioBuffer>,
-    pub(crate) params: DeviceParams,
+    // The device's bound parameters. `None` for a member that is NOT a plugin (an effect composite: its dry /
+    // wet and its entries' gain / mute / solo are bound by its own binding, not through the device ABI).
+    pub(crate) params: Option<DeviceParams>,
     pub(crate) sidechain: Option<SidechainBinding>,
     // A TARGETED `This` monitor on the device's `enabled` field: toggling it re-wires the unit (edge-only —
     // a disabled effect is skipped in the chain, its processor + params + DSP state left untouched).
@@ -340,6 +352,25 @@ pub(crate) struct LeafChain {
     pub(crate) monitor_node: Option<NodeId> // the EFFECTS-monitoring injector, rebuilt per re-wire
 }
 
+/// Visit one chain member's device parameters, recursing into an effect composite's ENTRIES — so an automation
+/// re-bind / param visit reaches every device in the cascade, not just the top-level plugins. A member that is
+/// not a plugin (a composite) contributes none of its own.
+pub(crate) fn visit_member_params(member: &mut Member, visit: &mut dyn FnMut(&mut DeviceParams)) {
+    if let Some(params) = &mut member.params { visit(params); }
+    if let ProcHandle::EffectComposite(binding) = &mut member.proc {
+        binding.for_each_params(visit);
+    }
+}
+
+/// Visit one chain member's sidechain bindings, recursing into an effect composite's ENTRIES — so the unit's
+/// sidechain re-resolve reaches a device nested inside a composite.
+pub(crate) fn visit_member_sidechains(member: &mut Member, visit: &mut dyn FnMut(&mut SidechainBinding)) {
+    if let Some(binding) = &mut member.sidechain { visit(binding); }
+    if let ProcHandle::EffectComposite(composite) = &mut member.proc {
+        composite.for_each_sidechain(visit);
+    }
+}
+
 /// A composite SLOT's persistent cluster (a direct-instrument child, e.g. a Playfield slot): the same per-member
 /// machinery as a leaf unit (instrument + midi/audio members + note source), reconciled EDGE-ONLY so a chain edit
 /// or an effect `enabled` toggle keeps every survivor's DSP state. Defined here (not in `composite`) so it can
@@ -363,9 +394,9 @@ impl SlotCluster {
 
     /// Visit every member's bound parameters (instrument + midi + audio), for the unit's automation re-bind.
     pub(crate) fn for_each_params(&mut self, visit: &mut dyn FnMut(&mut DeviceParams)) {
-        visit(&mut self.instrument.params);
-        for member in &mut self.midi { visit(&mut member.params); }
-        for member in &mut self.audio { visit(&mut member.params); }
+        if let Some(params) = &mut self.instrument.params { visit(params); }
+        for member in &mut self.midi { visit_member_params(member, visit); }
+        for member in &mut self.audio { visit_member_params(member, visit); }
     }
 
     /// Visit every audio member's sidechain binding, for the unit's sidechain re-resolve.
@@ -606,96 +637,8 @@ impl Engine {
         self.reconcile_units();
     }
 
-    /// THE output audio unit's uuid: the `AudioUnitBox` whose `type` (field 1) is `"output"`. It is a fixed
-    /// singleton (there is exactly one, and it never changes), so it is found once and wired statically.
-    fn output_unit_uuid(&self) -> Option<Uuid> {
-        self.graph.find_all_by_name("AudioUnitBox").iter()
-            .find(|unit| self.graph.field_value(&Address::of(unit.uuid, vec![1])).and_then(|value| value.as_str()) == Some("output"))
-            .map(|unit| unit.uuid)
-    }
-
     fn is_output_unit(&self, uuid: Uuid) -> bool {
         self.graph.field_value(&Address::of(uuid, vec![1])).and_then(|value| value.as_str()) == Some("output")
-    }
-
-    /// Wire THE output unit's channel strip as the engine's final master, fed by the static summing bus
-    /// (`master_output`, the engine's `master` bus that every instrument unit sums into). The strip applies
-    /// the output unit's volume / panning / mute (bound to its box) and its output is what `render` reads.
-    /// Built ONCE at bind — the output unit and its bus are fixed singletons, never reactive. Returns the
-    /// buffer `render` should read: the strip's output, or `master_output` directly if there is no output unit.
-    pub(crate) fn output_strip(&mut self, master_output: SharedAudioBuffer) -> SharedAudioBuffer {
-        let uuid = match self.output_unit_uuid() {
-            Some(uuid) => uuid,
-            None => return master_output
-        };
-        let params = Rc::new(StripParams::new());
-        let volume = params.clone();
-        self.graph.catchup_and_subscribe(Address::of(uuid, vec![UNIT_VOLUME_KEY]), move |value| {
-            if let Some(value) = value.as_float32() { volume.volume_db.set(value) }
-        });
-        let panning = params.clone();
-        self.graph.catchup_and_subscribe(Address::of(uuid, vec![UNIT_PANNING_KEY]), move |value| {
-            if let Some(value) = value.as_float32() { panning.panning.set(value) }
-        });
-        let mute = params.clone();
-        self.graph.catchup_and_subscribe(Address::of(uuid, vec![UNIT_MUTE_KEY]), move |value| {
-            if let Some(value) = value.as_bool() { mute.mute.set(value) }
-        });
-        // THE output unit's own audio-effect chain (e.g. a master Tidal), wired between the summing bus and
-        // the master strip: bus -> fx0 -> ... -> strip, ordered by device index. Each device binds its
-        // parameters like an instrument unit's, and the initial values are pushed below. The chain's STRUCTURE
-        // is built once at bind (the output unit is a fixed singleton, not reconciled), but its parameter EDITS
-        // must still reach the devices: a knob turn on a master effect marks `output_params_dirty`, and
-        // `reconcile_units` re-pushes the values through `refresh_params`, exactly like any other channel.
-        let mut source = master_output;
-        let mut source_id = self.master_id;
-        let audio = IndexedCollection::observe(&mut self.graph, Address::of(uuid, vec![UNIT_AUDIO_KEY]), EFFECT_INDEX_KEY);
-        let mut device_params: Vec<DeviceParams> = Vec::new();
-        let invalidate: Rc<dyn Fn()> = {
-            let dirty = self.output_params_dirty.clone();
-            Rc::new(move || dirty.set(true))
-        };
-        for device_uuid in audio.sorted() {
-            let resolved = self.graph.find_box(&device_uuid).and_then(|device_box| self.device_for_type(&device_box.name));
-            let device = match resolved {
-                Some(device) if device.kind == DEVICE_KIND_AUDIO_EFFECT => device,
-                _ => continue
-            };
-            if !self.device_enabled(device_uuid) {
-                continue; // a disabled effect is bypassed: not built, not wired into the chain
-            }
-            let node = Rc::new(RefCell::new(PluginAudioEffect::new(self.sample_rate, device)));
-            let node_state = node.borrow().state_ptr();
-            let node_sink: Rc<RefCell<dyn ParamSink>> = node.clone();
-            device_params.push(self.bind_device(device_uuid, device, node_state, ParamNode::Audio(node_sink), &invalidate));
-            node.borrow_mut().set_audio_source(source);
-            source = node.borrow().audio_output();
-            let meter_slot = node.borrow().meter_slot();
-            self.broadcasts.register(device_uuid, &[], crate::broadcast::PACKAGE_FLOAT_ARRAY, &meter_slot);
-            let node_id = self.context.register_processor(node);
-            self.context.set_label(node_id, device_label(&self.graph, &device_uuid));
-            self.context.register_edge(source_id, node_id);
-            source_id = node_id;
-        }
-        let position = self.transport.position();
-        for params in &device_params {
-            refresh_params(&params.handles, params.reg, params.state_ptr, position);
-        }
-        self.output_audio = Some(audio);
-        self.output_device_params = device_params;
-        // The output/master unit's volume/panning stay static (not automation-bound here); pass an empty override.
-        let strip = Rc::new(RefCell::new(ChannelStripProcessor::new(params, Rc::new(StripAutomation::new()), self.sample_rate)));
-        strip.borrow_mut().set_audio_source(source);
-        let strip_output = strip.borrow().audio_output();
-        // The output unit's strip meter feeds the mixer's OUTPUT channel strip, which subscribes to the unit's
-        // box address (like every other unit's strip meter at `unit.unit`). The master header/VU meter is a
-        // separate path: the worklet's own `PeakBroadcaster` at `EngineAddresses.PEAKS`, fed `output_ptr()`.
-        let strip_meter = strip.borrow().meter_slot();
-        self.broadcasts.register(uuid, &[], crate::broadcast::PACKAGE_FLOAT_ARRAY, &strip_meter);
-        let strip_id = self.context.register_processor(strip);
-        self.context.set_label(strip_id, String::from("strip:output"));
-        self.context.register_edge(source_id, strip_id); // the (effected) summing bus feeds the master strip
-        strip_output
     }
 
     /// Apply a transaction's recorded changes: tear down / build audio units whose MEMBERSHIP changed, then
@@ -706,7 +649,9 @@ impl Engine {
     /// Copy each stem's TAP (per its options: chain start / pre-strip / strip, TS `unit.audioOutput()`)
     /// into the stem staging (planar, stem i -> channels 2i / 2i+1). Runs right after `render`.
     pub(crate) fn copy_stem_outputs(&mut self) {
-        if self.stem_exports.is_empty() {
+        // `metronome_stem` alone is a valid export (every unit deselected, just the click), and it has no
+        // entry in `stem_exports`, so an emptiness check on that list alone would silently drop it.
+        if self.stem_exports.is_empty() && !self.metronome_stem {
             return;
         }
         let stems = core::mem::take(&mut self.stem_exports);
@@ -719,6 +664,13 @@ impl Engine {
             self.stem_staging[base + engine_env::RENDER_QUANTUM..base + 2 * engine_env::RENDER_QUANTUM].copy_from_slice(&buffer.right);
         }
         self.stem_exports = stems;
+        // The metronome is not an audio unit and has no tap, so it is appended by hand as the LAST pair, from
+        // the buffer `render` just filled. `set_stem_export` sized the staging for it.
+        if self.metronome_stem {
+            let base = self.stem_exports.len() * 2 * engine_env::RENDER_QUANTUM;
+            self.stem_staging[base..base + 2 * engine_env::RENDER_QUANTUM]
+                .copy_from_slice(&self.metronome_staging);
+        }
     }
 
     /// Mark `uuids` for a chain re-wire (e.g. the monitoring map changed) and enqueue them; the next
@@ -749,9 +701,6 @@ impl Engine {
         for uuid in changes.added {
             if self.audio_units.iter().any(|binding| binding.unit == uuid) {
                 continue;
-            }
-            if self.is_output_unit(uuid) {
-                continue; // THE output unit is a fixed singleton, wired statically at bind (see `output_strip`)
             }
             let binding = self.build_unit(uuid);
             binding.mark.mark(); // a new unit reconciles itself once (wires its instrument even with no tracks)
@@ -784,15 +733,6 @@ impl Engine {
         if self.solo_dirty.replace(false) {
             self.update_solo();
         }
-        // THE output unit is not in `audio_units` (built statically in `output_strip`), so a param/field edit on
-        // one of its effects cannot ride a unit reconcile — its invalidate just flags this, and we re-push the
-        // output-fx values here so a master effect's knob reaches the device like every other channel's.
-        if self.output_params_dirty.replace(false) {
-            let position = self.transport.position();
-            for device in &self.output_device_params {
-                refresh_params(&device.handles, device.reg, device.state_ptr, position);
-            }
-        }
     }
 
     /// Resolve SOLO into per-strip `forced_silent` flags, mirroring TS `Mixer.updateSolo` + the strip's
@@ -806,7 +746,8 @@ impl Engine {
             params: Rc<StripParams>,
             routed: Option<Uuid>,   // the bus this unit's strip feeds (None = the master)
             sends: Vec<Uuid>,       // aux-send target buses
-            bus: Option<Uuid>       // when this unit IS a bus: its AudioBusBox uuid
+            bus: Option<Uuid>,      // when this unit IS a bus: its AudioBusBox uuid
+            is_output: bool         // THE terminal master unit: exempt from solo silencing (it is the output)
         }
         let mut entries: Vec<(Uuid, Entry)> = Vec::with_capacity(self.audio_units.len());
         for unit in &self.audio_units {
@@ -818,10 +759,11 @@ impl Engine {
             let sends = unit.sends.iter()
                 .filter_map(|send| send.target.as_ref().and_then(|(uuid, _)| *uuid))
                 .collect();
+            let is_output = self.is_output_unit(unit.unit);
             entries.push((unit.unit, Entry {
                 solo: unit.strip_params.solo.get(),
                 params: unit.strip_params.clone(),
-                routed, sends, bus
+                routed, sends, bus, is_output
             }));
         }
         let unit_of_bus = |bus: &Uuid, entries: &Vec<(Uuid, Entry)>| entries.iter()
@@ -868,7 +810,29 @@ impl Engine {
             }
         }
         for (index, (_, entry)) in entries.iter().enumerate() {
-            entry.params.forced_silent.set(has_solo && !(entry.solo || virtual_solo[index]));
+            entry.params.forced_silent.set(has_solo && !(entry.solo || virtual_solo[index] || entry.is_output));
+        }
+    }
+
+    /// Evaluate each unit's SOLO AUTOMATION curve at `position`, write the resolved on/off into the unit's static
+    /// `solo` cell, and re-resolve the cross-strip `forced_silent` if any unit changed. Called once per PLAYING
+    /// quantum from `render` (solo is a mixer fact, so it cannot resolve inside a single strip like volume / mute):
+    /// this is the automation counterpart of the field subscription that arms `solo_dirty` for a manual toggle.
+    /// Mirrors TS, where `AutomatableParameter` solo events drive `Mixer.onChannelStripSoloChanged` -> `updateSolo`.
+    pub(crate) fn resolve_automated_solo(&mut self, position: f64) {
+        let mut changed = false;
+        for unit in &self.audio_units {
+            let soloed = match unit.strip_automation.solo.borrow().as_ref() {
+                Some(source) => source(position) >= 0.5, // TS `ValueMapping.bool.y`
+                None => continue
+            };
+            if unit.strip_params.solo.get() != soloed {
+                unit.strip_params.solo.set(soloed);
+                changed = true;
+            }
+        }
+        if changed {
+            self.update_solo();
         }
     }
 
@@ -1033,9 +997,6 @@ impl Engine {
                 }
                 self.context.remove_processor(tape.strip_id);
                 self.context.remove_processor(tape.player_id);
-                if let Some(node) = tape.monitor_node {
-                    self.context.remove_processor(node);
-                }
                 for member in tape.audio {
                     self.terminate_member(member);
                 }
@@ -1043,26 +1004,21 @@ impl Engine {
             Wired::Bus(bus) => {
                 // Drop this bus from the registry FIRST so any source unit still routed to it re-resolves to the
                 // master fallback (and skips removing its summed source from the now-gone sum). Then remove the
-                // enabled monitors, the fx params, the internal edges, and every node (sum + fx + strip).
+                // enabled monitor, the internal edges, the strip + own sum, and terminate every fx member.
                 self.bus_registry.remove(&bus.bus_uuid);
                 self.output_registry.remove(&Address::of(bus.bus_uuid, vec![]));
                 for sub in bus.subs {
                     self.graph.unsubscribe(sub);
                 }
-                for binding in bus.sidechains {
-                    for port in binding.ports {
-                        self.graph.unsubscribe(port.pointer_sub);
-                    }
-                }
-                for params in &bus.device_params {
-                    self.output_registry.remove(&Address::of(params.device_uuid(), vec![]));
-                }
-                self.teardown_device_params(bus.device_params);
                 for (source, target) in &bus.edges {
                     self.context.remove_edge(*source, *target);
                 }
-                for node in bus.nodes {
-                    self.context.remove_processor(node);
+                self.context.remove_processor(bus.strip_id);
+                if let Some(sum_node) = bus.sum_node {
+                    self.context.remove_processor(sum_node);
+                }
+                for member in bus.audio {
+                    self.terminate_member(member);
                 }
             }
             Wired::Frozen(frozen) => {
@@ -1105,6 +1061,14 @@ impl Engine {
     /// never registered one; the remove is a no-op), remove its processor node (a midi-fx has none), drop its
     /// sidechain ports' pointer monitors, and unsubscribe its parameter observations.
     pub(crate) fn terminate_member(&mut self, member: Member) {
+        // An EFFECT COMPOSITE member is a whole sub-graph, not one node: hand it to its own teardown (which
+        // drops every entry, its three nodes, its edges, its dry/wet bindings and its observations). Removing
+        // just `node_id` here would leak all of that.
+        if let ProcHandle::EffectComposite(binding) = member.proc {
+            self.graph.unsubscribe(member.enabled_sub);
+            self.teardown_effect_composite(*binding);
+            return;
+        }
         self.output_registry.remove(&Address::of(member.uuid, vec![]));
         if let Some(node_id) = member.node_id {
             self.context.remove_processor(node_id);
@@ -1115,8 +1079,11 @@ impl Engine {
             }
         }
         self.graph.unsubscribe(member.enabled_sub);
-        self.teardown_device_params(vec![member.params]);
+        if let Some(params) = member.params {
+            self.teardown_device_params(vec![params]);
+        }
     }
+
 
     /// Build a unit binding: its per-track region collections list (`track_sets`, shared with the
     /// sequencer), the track-membership subscription (key 20) the cascade fills, and the three device-chain

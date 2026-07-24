@@ -25,7 +25,6 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cell::{Cell, RefCell, UnsafeCell};
-use bindings::indexed_collection::IndexedCollection;
 use bindings::value_collection::ValueCollection;
 use crate::tempo_map::{SharedTempoMap, TempoMap};
 use boxgraph::address::{Address, Uuid};
@@ -113,6 +112,54 @@ pub(crate) struct CompositeSpec {
     // soloed and it is not. Playfield's slot keys are 40 / 41.
     pub(crate) child_mute_key: u16,
     pub(crate) child_solo_key: u16
+}
+
+/// How an effect composite hands its INPUT to its entries. `Broadcast` gives every entry the same signal (the
+/// plain parallel stack); `Stereo` splits per channel (entry 0 = left, entry 1 = right). Further splits
+/// (frequency, mid/side, tonal) become further variants — the rest of the composite is unchanged.
+// WASM CONTRACT: mirrors `EffectCompositeSpec["distributor"]` in core-wasm/src/engine-modules.ts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Distributor {
+    Broadcast = 0,
+    Stereo = 1,
+    Frequency = 2
+}
+
+impl Distributor {
+    fn from_u32(value: u32) -> Self {
+        match value {
+            1 => Self::Stereo,
+            2 => Self::Frequency,
+            _ => Self::Broadcast
+        }
+    }
+}
+
+/// An EFFECT composite box type: an audio or midi EFFECT that, instead of being a single leaf DSP, hosts a
+/// collection of ENTRIES, each its own effect chain, run in PARALLEL and mixed back together. Registered as
+/// data exactly like `CompositeSpec`, so the engine hardcodes no box name or field key.
+///
+/// Audio (`kind == DEVICE_KIND_AUDIO_EFFECT`): the input is distributed to every entry, each entry's chain
+/// output passes its own gain / mute / solo strip into the wet sum, and the composite emits
+/// `dry * input + wet * wetSum`. Note (`DEVICE_KIND_MIDI_EFFECT`): the incoming note stream is teed to every
+/// entry and their events merged; `gain_key` / `dry_key` / `wet_key` / `input_tap_field` are 0.
+#[derive(Clone)]
+pub(crate) struct EffectCompositeSpec {
+    box_type: String,
+    pub(crate) kind: u8,                     // DEVICE_KIND_AUDIO_EFFECT | DEVICE_KIND_MIDI_EFFECT
+    pub(crate) distributor: Distributor,
+    pub(crate) entries_field: u16,           // the composite's entry collection (host field)
+    pub(crate) index_key: u16,               // the entry box's own `index` (UI + sum / merge order)
+    pub(crate) chain_field: u16,             // the entry box's fx-host collection (audio or midi, per `kind`)
+    pub(crate) label_key: u16,               // the entry box's `label`
+    pub(crate) gain_key: u16,                // the entry's gain (dB); 0 for a midi composite (no gain)
+    pub(crate) pan_key: u16,                 // the entry's pan (bipolar); 0 = none (its strip stays centred)
+    pub(crate) mute_key: u16,                // the entry's mute (automatable; an entry has no `enabled`)
+    pub(crate) solo_key: u16,                // the entry's solo (resolved across siblings, like the mixer's)
+    pub(crate) dry_key: u16,                 // the composite's dry gain (dB); 0 for a midi composite
+    pub(crate) wet_key: u16,                 // the composite's wet gain (dB); 0 for a midi composite
+    pub(crate) input_tap_field: u16,         // the vertex a nested sidechain taps for the composite's INPUT; 0 = none
+    pub(crate) crossover_keys: [u16; 3]      // the Frequency distributor's interior crossover fields; all 0 otherwise
 }
 
 // Call a device's `process` through the shared function table: a wasm function pointer IS a table index,
@@ -294,8 +341,19 @@ pub(crate) mod broadcast;
 mod time_stretch;
 mod tempo_map;
 mod script_device;
-use audio_unit::{AudioUnitBinding, DeviceParams, Members};
+use audio_unit::{AudioUnitBinding, Members};
 mod composite;
+mod effect_composite;
+
+/// Serialises every test that touches the global `PULL` context. The production engine is single-threaded
+/// (only the audio thread runs engine code), so `PULL` is a plain `Shared` cell — but the test harness runs
+/// tests on parallel threads, where concurrent access is a data race (it segfaults). ONE lock for the crate:
+/// per-module mutexes would not serialise against each other.
+#[cfg(test)]
+pub(crate) fn pull_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 mod param_automation;
 use param_automation::ParamHandle;
 mod sample;
@@ -464,14 +522,29 @@ pub(crate) static MONITOR_OUTPUT: Shared<[f32; monitor::MONITOR_CHANNELS * RENDE
 
 // The note-bits slot of the unit CURRENTLY reconciling (its instruments capture it at construction —
 // composite slots share their unit's slot). Set around `reconcile_one`'s chain work, cleared after.
+#[cfg(not(test))]
 static CURRENT_UNIT_NOTE_BITS: Shared<Option<engine_env::telemetry::BroadcastSlot>> = Shared::new(None);
+#[cfg(test)]
+std::thread_local! {
+    // Tests run on parallel threads; the production engine is single-threaded, so the Shared cell is only
+    // sound there. Per-thread isolation keeps the tests deterministic (the PARAMS_SIGNAL pattern): the
+    // slot holds an Rc, and racing its non-atomic refcount across test threads corrupts it.
+    static CURRENT_UNIT_NOTE_BITS: core::cell::RefCell<Option<engine_env::telemetry::BroadcastSlot>> =
+        const { core::cell::RefCell::new(None) };
+}
 
 pub(crate) fn current_unit_note_bits() -> Option<engine_env::telemetry::BroadcastSlot> {
-    unsafe { CURRENT_UNIT_NOTE_BITS.get() }.clone()
+    #[cfg(not(test))]
+    { unsafe { CURRENT_UNIT_NOTE_BITS.get() }.clone() }
+    #[cfg(test)]
+    { CURRENT_UNIT_NOTE_BITS.with(|cell| cell.borrow().clone()) }
 }
 
 pub(crate) fn set_current_unit_note_bits(slot: Option<engine_env::telemetry::BroadcastSlot>) {
-    *unsafe { CURRENT_UNIT_NOTE_BITS.get() } = slot;
+    #[cfg(not(test))]
+    unsafe { *CURRENT_UNIT_NOTE_BITS.get() = slot; }
+    #[cfg(test)]
+    CURRENT_UNIT_NOTE_BITS.with(|cell| *cell.borrow_mut() = slot);
 }
 
 /// One link in a unit's event PULL CHAIN (the `NoteEventSource` chain, sequencer -> fx -> ... -> the
@@ -1011,6 +1084,14 @@ struct Engine {
     // into `stem_staging` after every render (stem i -> planar channels 2i / 2i+1).
     stem_exports: Vec<StemEntry>,
     stem_staging: Vec<f32>,
+    // The metronome renders HERE rather than straight into `output`, so its signal can be routed twice: it is
+    // always mixed into `output` (the live engine's and the mixdown's behaviour, unchanged), and when
+    // `metronome_stem` is set it is ALSO copied into the stem staging as the LAST pair
+    // (TS `exportConfiguration.metronome.stem`). A fixed array: no allocation on the render path.
+    metronome_staging: [f32; RENDER_QUANTUM * 2],
+    // Append the metronome as an additional stem, after every unit stem. Set together with `stem_exports`,
+    // which sizes `stem_staging` to include this extra pair.
+    metronome_stem: bool,
     // FROZEN units (TS `setFrozenAudio`): pre-rendered PCM per unit — the chain wiring swaps the
     // instrument + fx for a `FrozenPlayback` while an entry exists. `frozen_pending` holds the buffer the
     // worklet fills between `frozen_allocate` and `set_frozen_audio`.
@@ -1044,9 +1125,6 @@ struct Engine {
     solo_dirty: Rc<Cell<bool>>,
     unit_changes: Rc<RefCell<Members>>, // recorded by the audio-units membership observer, drained by reconcile
     dirty_units: Rc<RefCell<Vec<Uuid>>>, // unit uuids a related edit touched; reconcile rewires ONLY these, not all
-    output_audio: Option<IndexedCollection>, // THE output unit's audio-fx chain (built once at bind, see output_strip)
-    output_device_params: Vec<DeviceParams>, // the output-fx devices' bound params, retained so they stay observed
-    output_params_dirty: Rc<Cell<bool>>, // a param/field edit on an output-fx device: re-push its values in reconcile
     // The audio-output registry (Route C): each unit's strip output keyed by its box address, so a sidechain
     // pointer resolves to the buffer to read and the node to depend on. Each unit keeps its own persistent
     // sidechain bindings (see `AudioUnitBinding::sidechains`); the resolve pass re-resolves them per reconcile.
@@ -1067,6 +1145,7 @@ struct Engine {
     devices: Vec<DeviceReg>,           // loaded device plugins, in load order (the host registers them)
     device_box_types: Vec<(String, usize)>, // box-type name -> index into `devices`: the ONLY device glue.
     composites: Vec<CompositeSpec>,    // registered composite box types (host of a child collection); data, not code
+    effect_composites: Vec<EffectCompositeSpec>, // registered EFFECT composite box types (parallel fx entries)
     device_allocs: Vec<Box<[u8]>>,     // talc-owned regions handed to devices (data + stacks); kept alive
     controls: Rc<Controls>
 }
@@ -1089,6 +1168,8 @@ impl Engine {
             monitoring_map: Vec::new(),
             stem_exports: Vec::new(),
             stem_staging: Vec::new(),
+            metronome_staging: [0.0; RENDER_QUANTUM * 2],
+            metronome_stem: false,
             frozen_audio: Vec::new(),
             frozen_pending: Vec::new(),
             tempo: None,
@@ -1106,9 +1187,6 @@ impl Engine {
             solo_dirty: Rc::new(Cell::new(false)),
             unit_changes: Rc::new(RefCell::new(Members::default())),
             dirty_units: Rc::new(RefCell::new(Vec::new())),
-            output_audio: None,
-            output_device_params: Vec::new(),
-            output_params_dirty: Rc::new(Cell::new(false)),
             output_registry: AudioOutputBufferRegistry::new(),
             bus_registry: BTreeMap::new(),
             broadcasts: broadcast::Broadcasts::default(),
@@ -1118,6 +1196,7 @@ impl Engine {
             devices: Vec::new(),
             device_box_types: Vec::new(),
             composites: Vec::new(),
+            effect_composites: Vec::new(),
             device_allocs: Vec::new(),
             controls: Rc::new(Controls::new())
         }
@@ -1175,9 +1254,27 @@ impl Engine {
         self.composites.iter().find(|spec| spec.box_type == box_type).cloned()
     }
 
+    /// Register an EFFECT composite box type (parallel fx / note entries). The sibling of `register_composite`:
+    /// the whole glue is this one record, so a new split container is a registration, not engine code.
+    #[allow(clippy::too_many_arguments)] // one positional field key per facet, matching the loader
+    fn register_effect_composite(&mut self, box_type: String, kind: u8, distributor: Distributor, entries_field: u16,
+                                 index_key: u16, chain_field: u16, label_key: u16, gain_key: u16, pan_key: u16,
+                                 mute_key: u16, solo_key: u16, dry_key: u16, wet_key: u16, input_tap_field: u16,
+                                 crossover_keys: [u16; 3]) {
+        self.effect_composites.push(EffectCompositeSpec {box_type, kind, distributor, entries_field, index_key,
+            chain_field, label_key, gain_key, pan_key, mute_key, solo_key, dry_key, wet_key, input_tap_field,
+            crossover_keys});
+    }
+
+    /// The effect-composite spec for a box TYPE, if it is a registered parallel composite (else `None`, a leaf
+    /// effect). Cloned so a caller can use it while it also holds `&mut self` to build the entries.
+    pub(crate) fn effect_composite_for_type(&self, box_type: &str) -> Option<EffectCompositeSpec> {
+        self.effect_composites.iter().find(|spec| spec.box_type == box_type).cloned()
+    }
+
     /// Apply one forward-only transaction, returning the resulting checksum (or `Err` on a
     /// decode/apply failure). The value/note caches update themselves inside `transaction`.
-    fn apply_updates(&mut self, input: &[u8]) -> Result<[u8; 32], ()> {
+    fn apply_updates(&mut self, input: &[u8]) -> Result<(), ()> {
         let mut reader = ByteReader::new(input);
         let mut updates = decode_forward(&mut reader).map_err(|_| ())?;
         // The wire delete task carries only the uuid (frozen contract), so `decode_forward` leaves the name
@@ -1193,7 +1290,14 @@ impl Engine {
             }
         }
         self.graph.transaction(&updates, &self.registry).map_err(|_| ())?;
-        Ok(self.graph.checksum())
+        Ok(())
+    }
+
+    /// The rolling graph checksum, computed on demand (a full-graph field walk, O(all boxes)). Only the
+    /// throttled verification path (~1/s) needs it, so it must NOT run per transaction — a marquee selection
+    /// fires dozens of transactions per second, and hashing the whole graph each time dropped audio.
+    fn checksum(&self) -> [u8; 32] {
+        self.graph.checksum()
     }
 
     /// Render one quantum into `output` (planar L|R) and write the transport state into `state`.
@@ -1230,8 +1334,19 @@ impl Engine {
         let recording_start = self.recording_start;
         let denominator = self.recording_denominator;
         let sample_rate = self.sample_rate;
-        let Engine {transport, metronome, context, output_bus, blocks, tempo, tempo_map: _, controls, signature,
-            marker_track, marker_changes, midi_out, is_recording, is_counting_in, metronome_pref, ..} = self;
+        // Automated SOLO resolves at the ENGINE level (it silences other strips), so it cannot ride a single strip's
+        // per-block automation like volume / mute. Resolve it once at this quantum's start position and re-run the
+        // solo walk before the graph processes; only while transporting, so a paused block HOLDS the last solo
+        // (TS `UpdateClock` gates updates on `transporting`).
+        if self.transport.is_playing() {
+            self.resolve_automated_solo(self.transport.position());
+        }
+        let Engine {transport, metronome, metronome_staging, context, output_bus, blocks, tempo, tempo_map: _,
+            controls, signature, marker_track, marker_changes, midi_out, is_recording, is_counting_in,
+            metronome_pref, ..} = self;
+        // `Metronome::process` mixes ADDITIVELY, so its buffer starts cleared every quantum, exactly like
+        // `output` above.
+        metronome_staging.fill(0.0);
         // The signature events the metronome walks: the live signature track once bound, else a single
         // storage-signature entry from the controls (the pre-bind fallback).
         let signature_events = signature.as_ref().map(|track| track.events());
@@ -1256,7 +1371,9 @@ impl Engine {
             let active = events.as_deref().filter(|collection| !collection.is_empty());
             // collect this quantum's blocks (converting transport flags) and run the metronome per block
             transport.render_quantum(active, marker_slice, markers_enabled, |block| {
-                let (left, right) = output.split_at_mut(RENDER_QUANTUM);
+                // into the metronome's OWN buffer, not `output`: it is mixed into the output below and may
+                // additionally be copied out as its own stem.
+                let (left, right) = metronome_staging.split_at_mut(RENDER_QUANTUM);
                 metronome.process(block, signature_slice, &mut left[block.s0..block.s1], &mut right[block.s0..block.s1]);
                 blocks.push(Block {
                     index: blocks.len() as u32,
@@ -1319,6 +1436,12 @@ impl Engine {
         // messages and emit the 24-ppq Clock ticks over the transporting blocks, gated by the registered
         // MIDIOutputBoxes. Off-graph like the metronome.
         midi_output::process_transport_clock(midi_out, blocks.as_slice(), sample_rate);
+        // The metronome into the main mix. Identical to when it wrote into `output` directly (both mixes are
+        // additive into a cleared buffer), and it stays unconditional: a stems render never reads `output`
+        // (the worker takes the stem staging and returns early), so there is nothing to gate it on.
+        for index in 0..RENDER_QUANTUM * 2 {
+            output[index] += metronome_staging[index];
+        }
         // drive the processor graph over the quantum's blocks (advancing or static), then mix the output bus in
         context.process(&ProcessInfo {blocks: blocks.as_slice()});
         if let Some(buffer) = output_bus.as_ref() {
@@ -1616,15 +1739,17 @@ impl Engine {
             None
         };
         self.tempo_map.borrow_mut().update(self.controls.bpm.get(), tempo_curve);
-        // Master summing bus: every instrument audio unit's channel strip sums into it. It is the static
-        // input bus of THE output audio unit, whose channel strip (built by `output_strip`) is the engine's
-        // final master and what `render` reads. Both the bus and the output unit are fixed singletons.
+        // Master summing bus: every audio unit's channel strip sums into it (`sum_of(None)`). It is the SUM of
+        // THE output audio unit, which reconciles like any bus (`reconcile_bus`): master-sum -> its fx chain ->
+        // its strip, whose output it republishes to `output_bus` (what `render` reads) on every rebuild.
         let output_buffer = shared_audio_buffer();
         let master = Rc::new(RefCell::new(AudioBusProcessor::new(output_buffer.clone())));
         self.master_id = self.context.register_processor(master.clone());
         self.context.set_label(self.master_id, alloc::string::String::from("master-sum"));
         self.master = Some(master);
-        self.output_bus = Some(self.output_strip(output_buffer)); // master strip output (or the bus, if no output unit)
+        // Fallback until the output unit reconciles (in `observe_audio_units` below): render the raw master sum.
+        // The output unit reconciles like any bus (`reconcile_bus`) and republishes `output_bus` to its strip.
+        self.output_bus = Some(output_buffer);
         // The MIDI-out targets must register BEFORE the units reconcile (inside `observe_audio_units`): a
         // MIDI-output unit's initial CC push resolves its device through the registry (TS resolves it off
         // the complete graph at construction).
@@ -1912,9 +2037,17 @@ pub extern "C" fn profile_report(out_ptr: u32, max: u32) -> u32 {
     }
 }
 
+/// Refresh the 32-byte checksum buffer from the current graph and return its pointer. Computing the
+/// checksum is a full-graph walk (O(all boxes)), so it runs ONLY here — on the throttled verification
+/// round-trip (~1/s), never per transaction. Called from the worklet's checksum-verify path.
 #[no_mangle]
 pub extern "C" fn checksum_ptr() -> *const u8 {
-    unsafe { CHECKSUM.get().as_ptr() }
+    unsafe {
+        if let Some(engine) = ENGINE.get().as_ref() {
+            CHECKSUM.get().copy_from_slice(&engine.checksum());
+        }
+        CHECKSUM.get().as_ptr()
+    }
 }
 
 #[no_mangle]
@@ -1964,8 +2097,7 @@ pub extern "C" fn apply_updates(len: usize) -> i32 {
         // (we never push), so index by the raw ptr; `len` is bounded by the host to the buffer capacity.
         let input = core::slice::from_raw_parts(INPUT.get().as_ptr(), len);
         match engine.apply_updates(input) {
-            Ok(checksum) => {
-                CHECKSUM.get().copy_from_slice(&checksum);
+            Ok(()) => {
                 engine.reconcile_units(); // apply any audio-unit membership change this transaction recorded
                 engine.sync_midi_targets(); // realize any MIDIOutputBox joins / leaves this transaction recorded
                 0
@@ -2003,10 +2135,14 @@ pub extern "C" fn render() {
 /// LE]` (bit0 includeAudioEffects, bit1 includeSends, bit2 useInstrumentOutput, bit3 skipChannelStrip) in
 /// the input scratch, in EXPORT ORDER. Call BEFORE `bind` (an offline render configures once); allocates
 /// the staging each render fills (stem i -> planar channels 2i / 2i+1 at `stem_output_ptr`).
+/// `metronome_stem` (TS `exportConfiguration.metronome.stem`) appends the metronome as one further pair
+/// AFTER the unit stems, so it is part of the same allocation rather than a second call that could leave the
+/// staging a pair short.
 #[no_mangle]
-pub extern "C" fn set_stem_export(count: u32) {
+pub extern "C" fn set_stem_export(count: u32, metronome_stem: u32) {
     unsafe {
         if let Some(engine) = ENGINE.get().as_mut() {
+            engine.metronome_stem = metronome_stem != 0;
             let bytes = core::slice::from_raw_parts(INPUT.get().as_ptr(), count as usize * 20);
             let mut stems = Vec::with_capacity(count as usize);
             for index in 0..count as usize {
@@ -2022,7 +2158,8 @@ pub extern "C" fn set_stem_export(count: u32) {
                     skip_channel_strip: flags & 8 != 0
                 });
             }
-            engine.stem_staging = alloc::vec![0.0; stems.len() * 2 * RENDER_QUANTUM];
+            let pairs = stems.len() + usize::from(engine.metronome_stem);
+            engine.stem_staging = alloc::vec![0.0; pairs * 2 * RENDER_QUANTUM];
             engine.stem_exports = stems;
         }
     }
@@ -2541,6 +2678,32 @@ pub extern "C" fn composite_register(name_len: usize, children_field: u32, index
             engine.register_composite(String::from(name), children_field as u16, index_key as u16, exclude_key as u16,
                 cell_instrument_field as u16, cell_midi_field as u16, cell_audio_field as u16, child_enabled_key as u16,
                 child_mute_key as u16, child_solo_key as u16);
+        }
+    }
+}
+
+/// Register an EFFECT composite box type (a parallel fx / note stack): its entry collection + the entry box's
+/// field keys + the composite's dry / wet + input tap. The sibling of `composite_register`; the engine reads no
+/// specifics beyond this record, so a new split container needs no engine change.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "C" fn effect_composite_register(name_len: usize, kind: u32, distributor: u32, entries_field: u32,
+                                            index_key: u32, chain_field: u32, label_key: u32, gain_key: u32,
+                                            pan_key: u32, mute_key: u32, solo_key: u32, dry_key: u32, wet_key: u32,
+                                            input_tap_field: u32, crossover1_key: u32, crossover2_key: u32,
+                                            crossover3_key: u32) {
+    unsafe {
+        let engine = match ENGINE.get().as_mut() {
+            Some(engine) => engine,
+            None => return
+        };
+        let bytes = core::slice::from_raw_parts(INPUT.get().as_ptr(), name_len);
+        if let Ok(name) = core::str::from_utf8(bytes) {
+            engine.register_effect_composite(String::from(name), kind as u8, Distributor::from_u32(distributor),
+                entries_field as u16, index_key as u16, chain_field as u16, label_key as u16, gain_key as u16,
+                pan_key as u16, mute_key as u16, solo_key as u16, dry_key as u16, wet_key as u16,
+                input_tap_field as u16,
+                [crossover1_key as u16, crossover2_key as u16, crossover3_key as u16]);
         }
     }
 }

@@ -15,6 +15,7 @@ import {UnknownMidiEffectDevice} from "./midi-effects/UnknownMidiEffectDevice"
 import {SoundfontDeviceBox} from "./instruments/SoundfontDeviceBox"
 import {MaximizerDeviceBox} from "./audio-effects/MaximizerDeviceBox"
 import {CompressorDeviceBox} from "./audio-effects/CompressorDeviceBox"
+import {AutotuneDeviceBox} from "./audio-effects/AutotuneDeviceBox"
 import {CrusherDeviceBox} from "./audio-effects/CrusherDeviceBox"
 import {FoldDeviceBox} from "./audio-effects/FoldDeviceBox"
 import {MIDIOutputDeviceBox} from "./instruments/MIDIOutputDeviceBox"
@@ -35,6 +36,10 @@ import {ApparatDeviceBox} from "./instruments/ApparatDeviceBox"
 import {NoopInstrumentBox} from "./instruments/NoopInstrumentBox"
 import {CompositeDeviceBox} from "./instruments/CompositeDeviceBox"
 import {CompositeCellBox} from "./instruments/CompositeCellBox"
+import {AudioEffectCompositeBox} from "./audio-effects/AudioEffectCompositeBox"
+import {AudioEffectCompositeCellBox} from "./audio-effects/AudioEffectCompositeCellBox"
+import {StereoCompositeBox} from "./audio-effects/StereoCompositeBox"
+import {FrequencySplitBox} from "./audio-effects/FrequencySplitBox"
 
 export const DeviceDefinitions = [
     UnknownAudioEffectDevice,
@@ -46,6 +51,7 @@ export const DeviceDefinitions = [
     CompressorDeviceBox,
     GateDeviceBox,
     DelayDeviceBox,
+    AutotuneDeviceBox,
     CrusherDeviceBox,
     DattorroReverbDeviceBox,
     VelocityDeviceBox,
@@ -75,5 +81,9 @@ export const DeviceDefinitions = [
     ApparatDeviceBox,
     NoopInstrumentBox,
     CompositeDeviceBox,
-    CompositeCellBox
+    CompositeCellBox,
+    AudioEffectCompositeBox,
+    AudioEffectCompositeCellBox,
+    StereoCompositeBox,
+    FrequencySplitBox
 ]

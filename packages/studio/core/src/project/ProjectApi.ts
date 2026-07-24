@@ -18,7 +18,7 @@ import {
     UUID
 } from "@opendaw/lib-std"
 import {ppqn, PPQN} from "@opendaw/lib-dsp"
-import {BoxGraph, Field, IndexedBox, PointerField} from "@opendaw/lib-box"
+import {Box, BoxGraph, Field, IndexedBox, PointerField} from "@opendaw/lib-box"
 import {AudioUnitType, Pointers} from "@opendaw/studio-enums"
 import {
     AudioClipBox,
@@ -170,6 +170,28 @@ export class ProjectApi {
         return factory.create(this.#project, field, IndexedBox.insertOrder(field, insertIndex))
     }
 
+    // MOVE existing effect boxes into `targetField` at `insertIndex`: re-home each box's `host` pointer (so it
+    // leaves its current chain) and reindex both the source chains and the target chain contiguously. Direction-
+    // agnostic — the source may be the parent chain, another composite branch, or `targetField` itself (a plain
+    // same-chain reorder). The caller guards against a cycle (moving a composite into its own subtree).
+    moveEffects(targetField: Field<EffectPointerType>, boxes: ReadonlyArray<EffectBox>, insertIndex: int): void {
+        if (boxes.length === 0) {return}
+        const movedSet = new Set<Box>(boxes)
+        // The chains the boxes currently live in, captured BEFORE re-homing so they can be reindexed afterwards.
+        const sourceFields = new Set<Field<EffectPointerType>>()
+        boxes.forEach(box => box.host.targetVertex.ifSome(vertex => sourceFields.add(vertex as Field<EffectPointerType>)))
+        const moved = boxes.slice().sort((left, right) => left.index.getValue() - right.index.getValue())
+        const kept = IndexedBox.collectIndexedBoxes(targetField).filter(box => !movedSet.has(box))
+        const at = clamp(insertIndex, 0, kept.length)
+        const finalOrder: ReadonlyArray<IndexedBox> = [...kept.slice(0, at), ...moved, ...kept.slice(at)]
+        moved.forEach(box => box.host.refer(targetField))
+        finalOrder.forEach((box, index) => box.index.setValue(index))
+        sourceFields.forEach(field => {
+            if (field === targetField) {return}
+            IndexedBox.collectIndexedBoxes(field).forEach((box, index) => box.index.setValue(index))
+        })
+    }
+
     createNoteTrack(audioUnitBox: AudioUnitBox, insertIndex: int = Number.MAX_SAFE_INTEGER): TrackBox {
         return this.#createTrack({field: audioUnitBox.tracks, trackType: TrackType.Notes, insertIndex})
     }
@@ -276,10 +298,17 @@ export class ProjectApi {
         })
     }
 
-    duplicateRegion<R extends AnyRegionBoxAdapter>(region: R, options?: { findFreeSpace?: boolean }): Option<R> {
+    // The copy is created DIRECTLY at its final position and overlap behavior (clip / push-existing /
+    // keep-existing) is evaluated exactly once, at that final range. An explicit `position` wins over both
+    // defaults; without one the copy lands after the region (`region.complete`). Never resolve against a
+    // transient placement: an abutting neighbor must not be trimmed / pushed for a collision that only
+    // exists because the caller repositions the copy one statement later.
+    duplicateRegion<R extends AnyRegionBoxAdapter>(region: R,
+                                                  options?: { findFreeSpace?: boolean, position?: ppqn }): Option<R> {
         if (region.trackBoxAdapter.isEmpty()) {return Option.None}
         const track = region.trackBoxAdapter.unwrap()
-        if (options?.findFreeSpace === true) {
+        const explicitPosition = options?.position
+        if (!isDefined(explicitPosition) && options?.findFreeSpace === true) {
             let insert = region.complete
             for (const {position, complete} of track.regions.collection.iterateFrom(region.complete)) {
                 if (insert + region.duration <= position) {break}
@@ -289,18 +318,18 @@ export class ProjectApi {
                 position: insert,
                 consolidate: true
             }) as R)
-        } else {
-            const clearFrom = region.complete
-            const clearTo = region.complete + region.duration
-            const targetTrack = this.#project.overlapResolver.resolveTargetTrack(track, clearFrom, clearTo)
-            const solver = this.#project.overlapResolver.fromRange(targetTrack, clearFrom, clearTo)
-            const duplicate = region.copyTo({
-                position: region.complete,
-                consolidate: true
-            }) as R
-            solver()
-            return Option.wrap(duplicate)
         }
+        const position = explicitPosition ?? region.complete
+        const complete = position + region.duration
+        const targetTrack = this.#project.overlapResolver.resolveTargetTrack(track, position, complete)
+        const solver = this.#project.overlapResolver.fromRange(targetTrack, position, complete)
+        const duplicate = region.copyTo({
+            position,
+            target: targetTrack.box.regions,
+            consolidate: true
+        }) as R
+        solver()
+        return Option.wrap(duplicate)
     }
 
     async exportMIDI(collection: NoteEventCollectionBoxAdapter, suggestedName: string = "notes.mid") {

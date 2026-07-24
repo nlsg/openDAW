@@ -1,7 +1,14 @@
-import {DeviceHost, Devices, EffectDeviceBoxAdapter, InstrumentFactories, PresetHeader} from "@opendaw/studio-adapters"
+import {
+    AudioCompositeAdapter,
+    DeviceHost,
+    Devices,
+    EffectDeviceBoxAdapter,
+    InstrumentFactories,
+    PresetHeader
+} from "@opendaw/studio-adapters"
 import {EffectFactories, MenuItem} from "@opendaw/studio-core"
 import {IndexedBox, PrimitiveField, PrimitiveValues} from "@opendaw/lib-box"
-import {Editing, isDefined, panic, RuntimeNotifier, UUID} from "@opendaw/lib-std"
+import {Editing, isDefined, RuntimeNotifier, UUID} from "@opendaw/lib-std"
 import {Promises} from "@opendaw/lib-runtime"
 import {StudioService} from "@/service/StudioService"
 import {RouteLocation} from "@opendaw/lib-jsx"
@@ -13,29 +20,36 @@ export namespace MenuItems {
         const {editing, api} = project
         const audioUnit = deviceHost.audioUnitBoxAdapter()
         const {canProcessMidi, manualUrl, name} = deviceHost.inputAdapter.mapOr(input => ({
-            canProcessMidi: input.type === "instrument",
+            canProcessMidi: input.accepts === "midi",
             manualUrl: input.manualUrl,
             name: input.labelField.getValue()
         }), {canProcessMidi: false, manualUrl: "manuals", name: "Unknown"})
+        // A one-sided host takes only one chain kind, so each "Add ..." is hidden unless the host has that chain.
+        const optMidiField = deviceHost.midiEffectsField
+        const optAudioField = deviceHost.audioEffectsField
         parent.addMenuItem(
             populateMenuItemToNavigateToManual(manualUrl, name),
-            MenuItem.default({label: "Add Midi-Effect", separatorBefore: true, selectable: canProcessMidi})
+            MenuItem.default({
+                label: "Add Midi-Effect",
+                separatorBefore: true,
+                hidden: !canProcessMidi || optMidiField.isEmpty()
+            })
                 .setRuntimeChildrenProcedure(parent => parent.addMenuItem(...EffectFactories.MidiList
                     .map(entry => MenuItem.default({
                         label: entry.defaultName,
                         icon: entry.defaultIcon,
                         separatorBefore: entry.separatorBefore
                     }).setTriggerProcedure(() => editing.modify(() =>
-                        api.insertEffect(deviceHost.midiEffects.field(), entry, 0))))
+                        api.insertEffect(optMidiField.unwrap("midiEffectsField"), entry, 0))))
                 )),
-            MenuItem.default({label: "Add Audio Effect"})
+            MenuItem.default({label: "Add Audio Effect", hidden: optAudioField.isEmpty()})
                 .setRuntimeChildrenProcedure(parent => parent.addMenuItem(...EffectFactories.AudioList
                     .map(entry => MenuItem.default({
                         label: entry.defaultName,
                         icon: entry.defaultIcon,
                         separatorBefore: entry.separatorBefore
                     }).setTriggerProcedure(() => editing.modify(() =>
-                        api.insertEffect(deviceHost.audioEffects.field(), entry, 0))))
+                        api.insertEffect(optAudioField.unwrap("audioEffectsField"), entry, 0))))
                 ))
         )
         populatePresetSubmenu(parent, service, deviceHost, {kind: "instrument-context"})
@@ -52,6 +66,31 @@ export namespace MenuItems {
                                                               value: V) =>
         MenuItem.default({label, checked: primitive.getValue() === value})
             .setTriggerProcedure(() => editing.modify(() => primitive.setValue(value)))
+
+    // The hamburger of a composite BRANCH (cell) editor: the manual goes to the PARENT composite device,
+    // and "Add Audio Effect" inserts into this branch's own chain (a cell hosts no midi chain, no instrument).
+    export const forCompositeCell = (parent: MenuItem,
+                                     service: StudioService,
+                                     host: DeviceHost,
+                                     composite: AudioCompositeAdapter): void => {
+        const {editing, api} = service.project
+        const optAudioField = host.audioEffectsField
+        parent.addMenuItem(
+            populateMenuItemToNavigateToManual(composite.manualUrl, composite.labelField.getValue()),
+            MenuItem.default({
+                label: "Add Audio Effect",
+                separatorBefore: true,
+                hidden: optAudioField.isEmpty()
+            }).setRuntimeChildrenProcedure(parent => parent.addMenuItem(...EffectFactories.AudioList
+                .map(entry => MenuItem.default({
+                    label: entry.defaultName,
+                    icon: entry.defaultIcon,
+                    separatorBefore: entry.separatorBefore
+                }).setTriggerProcedure(() => editing.modify(() =>
+                    api.insertEffect(optAudioField.unwrap("audioEffectsField"), entry, 0))))
+            ))
+        )
+    }
 
     export const forEffectDevice = (parent: MenuItem,
                                     service: StudioService,
@@ -100,16 +139,16 @@ export namespace MenuItems {
                 entry.type === kind && entry.deviceHost() === host)
             .toSorted((a, b) => a.indexField.getValue() - b.indexField.getValue())
 
+    // A host that takes no chain of `kind` (a one-sided composite entry) holds no such effects.
     const allEffectsInHost = (service: StudioService,
                               host: DeviceHost,
-                              kind: PresetEffectKind): ReadonlyArray<EffectDeviceBoxAdapter> => {
-        const field = kind === "audio-effect" ? host.audioEffects.field() : host.midiEffects.field()
-        return field.pointerHub.incoming()
-            .map(({box}) => service.project.boxAdapters.adapterFor(box, Devices.isAny))
-            .filter((adapter): adapter is EffectDeviceBoxAdapter =>
-                adapter.type === "audio-effect" || adapter.type === "midi-effect")
-            .toSorted((a, b) => a.indexField.getValue() - b.indexField.getValue())
-    }
+                              kind: PresetEffectKind): ReadonlyArray<EffectDeviceBoxAdapter> =>
+        DeviceHost.chainFieldOf(host, kind === "audio-effect" ? "audio" : "midi")
+            .mapOr(field => field.pointerHub.incoming()
+                .map(({box}) => service.project.boxAdapters.adapterFor(box, Devices.isAny))
+                .filter((adapter): adapter is EffectDeviceBoxAdapter =>
+                    adapter.type === "audio-effect" || adapter.type === "midi-effect")
+                .toSorted((a, b) => a.indexField.getValue() - b.indexField.getValue()), [])
 
     const saveSingleOrChain = async (actions: PresetService,
                                      kind: PresetEffectKind,
@@ -209,27 +248,18 @@ export namespace MenuItems {
     const populateMenuItemToCreateEffect = (service: StudioService, host: DeviceHost, adapter: EffectDeviceBoxAdapter) => {
         const {project} = service
         const {editing, api} = project
-        return adapter.accepts === "audio"
-            ? MenuItem.default({label: "Add Audio Effect", separatorBefore: true})
-                .setRuntimeChildrenProcedure(parent => parent
-                    .addMenuItem(...EffectFactories.AudioList
-                        .map(factory => MenuItem.default({
-                            label: factory.defaultName,
-                            icon: factory.defaultIcon,
-                            separatorBefore: factory.separatorBefore
-                        }).setTriggerProcedure(() =>
-                            editing.modify(() => api.insertEffect(host.audioEffects.field(), factory, adapter.indexField.getValue() + 1))))
-                    ))
-            : adapter.accepts === "midi"
-                ? MenuItem.default({label: "Add Midi Effect", separatorBefore: true})
-                    .setRuntimeChildrenProcedure(parent => parent
-                        .addMenuItem(...EffectFactories.MidiList
-                            .map(factory => MenuItem.default({
-                                label: factory.defaultName,
-                                icon: factory.defaultIcon,
-                                separatorBefore: factory.separatorBefore
-                            }).setTriggerProcedure(() => editing.modify(() => api
-                                .insertEffect(host.midiEffects.field(), factory, adapter.indexField.getValue() + 1))))
-                        )) : panic(`Unknown accepts value: ${adapter.accepts}`)
+        // `adapter` already sits in this host's chain of its own kind, so that chain field is present.
+        const field = DeviceHost.chainFieldOf(host, adapter.accepts).unwrap(`host takes no ${adapter.accepts} effects`)
+        const isAudio = adapter.accepts === "audio"
+        return MenuItem.default({label: isAudio ? "Add Audio Effect" : "Add Midi Effect", separatorBefore: true})
+            .setRuntimeChildrenProcedure(parent => parent
+                .addMenuItem(...(isAudio ? EffectFactories.AudioList : EffectFactories.MidiList)
+                    .map(factory => MenuItem.default({
+                        label: factory.defaultName,
+                        icon: factory.defaultIcon,
+                        separatorBefore: factory.separatorBefore
+                    }).setTriggerProcedure(() => editing.modify(() =>
+                        api.insertEffect(field, factory, adapter.indexField.getValue() + 1))))
+                ))
     }
 }

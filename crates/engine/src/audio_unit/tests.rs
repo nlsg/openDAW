@@ -378,8 +378,7 @@ fn live_note_signal_reaches_the_leaf_sequencer() {
 // The MidiOut node pulls through the process-global `PULL` cell (single-threaded on wasm); tests that
 // drive `context.process` must not run concurrently, so they serialize on this lock.
 fn pull_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    crate::pull_lock() // the ONE crate-wide lock (see `crate::pull_lock`)
 }
 
 const MIDI_DEV: Uuid = [30u8; 16];
@@ -769,6 +768,116 @@ fn read_audio_region_reads_time_stretch_config_and_file_transients() {
 }
 
 #[test]
+fn a_transient_marker_drag_live_updates_a_time_stretch_region() {
+    // Editing a transient marker in the studio (issue #114) must reach the running time-stretch sequencer:
+    // the markers live on the SOURCE FILE, not the region or play-mode box, so `build_audio_region` gives each
+    // marker its own drag monitor. Regression for "moving a transient does nothing until reload".
+    use super::tracks::{build_audio_region, unsubscribe_audio_region, AudioTrackContent};
+    use value::region::RegionCollection;
+    const REGION: Uuid = [80u8; 16];
+    const FILE: Uuid = [81u8; 16];
+    const STRETCH: Uuid = [82u8; 16];
+    const W0: Uuid = [83u8; 16];
+    const W1: Uuid = [84u8; 16];
+    const T0: Uuid = [85u8; 16];
+    const T1: Uuid = [86u8; 16];
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(FILE, "AudioFileBox", &[(10, FieldValue::Hook)]),
+        graph_box(T0, "TransientMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(FILE, vec![10])))), (2, FieldValue::Float32(0.0))]),
+        graph_box(T1, "TransientMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(FILE, vec![10])))), (2, FieldValue::Float32(0.5))]),
+        graph_box(STRETCH, "AudioTimeStretchBox", &[(1, FieldValue::Hook), (2, FieldValue::Int32(1)), (3, FieldValue::Float32(1.0))]),
+        graph_box(W0, "WarpMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(STRETCH, vec![1])))), (2, FieldValue::Int32(0)), (3, FieldValue::Float32(0.0))]),
+        graph_box(W1, "WarpMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(STRETCH, vec![1])))), (2, FieldValue::Int32(3840)), (3, FieldValue::Float32(1.0))]),
+        graph_box(REGION, "AudioRegionBox", &[
+            (2, FieldValue::Pointer(Some(Address::box_of(FILE)))), (8, FieldValue::Pointer(Some(Address::box_of(STRETCH)))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Float32(3840.0))
+        ])
+    ]);
+    let content: super::tracks::SharedAudioTrack = Rc::new(RefCell::new(AudioTrackContent {
+        uuid: [88u8; 16], regions: RegionCollection::new(), clips: Vec::new()
+    }));
+    let tempo_map = Rc::new(RefCell::new(TempoMap::fixed(120.0)));
+    let mark = super::DirtyMark {units: Rc::new(RefCell::new(Vec::new())), unit: [88u8; 16]};
+    let region_changes = Rc::new(RefCell::new(super::Members::default()));
+    let binding = build_audio_region(&mut engine.graph, &content, REGION, &tempo_map, &mark, &region_changes)
+        .expect("a time-stretch region builds");
+    assert_eq!(content.borrow().regions.iter().next().expect("one region").transients, vec![0.0, 0.5],
+        "transients read at build");
+    // DRAG T1 0.5 -> 0.8: the per-marker monitor re-reads the region's transients live.
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(T1, vec![2]),
+        old: FieldValue::Float32(0.5), new: FieldValue::Float32(0.75)
+    }], &engine.registry).expect("drag transient marker");
+    assert_eq!(content.borrow().regions.iter().next().expect("one region").transients, vec![0.0, 0.75],
+        "a transient DRAG live-updates the region's transient positions (kept sorted)");
+    unsubscribe_audio_region(&mut engine.graph, binding);
+}
+
+#[test]
+fn switching_play_mode_live_rebinds_so_new_box_field_edits_take_effect() {
+    // Bug: after switching a region TO time-stretch, changing Once/Repeat/Pingpong (or transpose/rate) did nothing
+    // until save+reopen — `playmode_sub` was bound once to the play-mode target present AT BUILD (here: none, the
+    // region starts native) and never re-resolved when the pointer was repointed to the new box. The pointer
+    // monitor must queue a region rebuild on repoint so the new box's subsequent field edits are seen live.
+    use super::tracks::{build_audio_region, unsubscribe_audio_region, AudioTrackContent, AUDIO_REGION_PLAYMODE_KEY};
+    use crate::time_stretch::TransientPlayMode;
+    use value::region::RegionCollection;
+    const REGION: Uuid = [90u8; 16];
+    const FILE: Uuid = [91u8; 16];
+    const STRETCH: Uuid = [92u8; 16];
+    const W0: Uuid = [93u8; 16];
+    const W1: Uuid = [94u8; 16];
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(FILE, "AudioFileBox", &[(10, FieldValue::Hook)]),
+        // A time-stretch play-mode box exists (mode 1 = Repeat) but the region starts NATIVE (playMode = None).
+        graph_box(STRETCH, "AudioTimeStretchBox", &[(1, FieldValue::Hook), (2, FieldValue::Int32(1)), (3, FieldValue::Float32(1.0))]),
+        graph_box(W0, "WarpMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(STRETCH, vec![1])))), (2, FieldValue::Int32(0)), (3, FieldValue::Float32(0.0))]),
+        graph_box(W1, "WarpMarkerBox", &[(1, FieldValue::Pointer(Some(Address::of(STRETCH, vec![1])))), (2, FieldValue::Int32(3840)), (3, FieldValue::Float32(1.0))]),
+        graph_box(REGION, "AudioRegionBox", &[
+            (2, FieldValue::Pointer(Some(Address::box_of(FILE)))),
+            (AUDIO_REGION_PLAYMODE_KEY, FieldValue::Pointer(None)),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Float32(3840.0))
+        ])
+    ]);
+    let content: super::tracks::SharedAudioTrack = Rc::new(RefCell::new(AudioTrackContent {
+        uuid: [99u8; 16], regions: RegionCollection::new(), clips: Vec::new()
+    }));
+    let tempo_map = Rc::new(RefCell::new(TempoMap::fixed(120.0)));
+    let mark = super::DirtyMark {units: Rc::new(RefCell::new(Vec::new())), unit: [99u8; 16]};
+    let region_changes = Rc::new(RefCell::new(super::Members::default()));
+    let binding = build_audio_region(&mut engine.graph, &content, REGION, &tempo_map, &mark, &region_changes)
+        .expect("native region builds");
+    assert!(content.borrow().regions.iter().next().expect("one region").time_stretch.is_none(), "starts native");
+    // SWITCH to time-stretch: repoint the region's play-mode pointer to the new box.
+    engine.graph.transaction(&[Update::Pointer {
+        address: Address::of(REGION, vec![AUDIO_REGION_PLAYMODE_KEY]),
+        old: None, new: Some(Address::box_of(STRETCH))
+    }], &engine.registry).expect("switch to time-stretch");
+    assert!(region_changes.borrow().removed.contains(&REGION) && region_changes.borrow().added.contains(&REGION),
+        "repointing the play-mode pointer queues a full region rebuild (else the new box's subs never bind)");
+    // Play out the queued rebuild the way reconcile_audio_regions would: drop the stale binding, rebuild fresh.
+    content.borrow_mut().regions.retain(|region| region.region_uuid != REGION);
+    unsubscribe_audio_region(&mut engine.graph, binding);
+    region_changes.borrow_mut().removed.clear();
+    region_changes.borrow_mut().added.clear();
+    let binding = build_audio_region(&mut engine.graph, &content, REGION, &tempo_map, &mark, &region_changes)
+        .expect("rebuilt time-stretch region");
+    assert_eq!(content.borrow().regions.iter().next().expect("one region").time_stretch.as_ref()
+        .expect("now time-stretch").transient_play_mode, TransientPlayMode::Repeat, "rebuilt region reads the new box");
+    // THE FIX: editing Once/Repeat/Pingpong on the now-bound box must re-read the region live (Repeat -> Once).
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(STRETCH, vec![2]),
+        old: FieldValue::Int32(1), new: FieldValue::Int32(0)
+    }], &engine.registry).expect("change transient play-mode");
+    assert_eq!(content.borrow().regions.iter().next().expect("one region").time_stretch.as_ref()
+        .expect("still time-stretch").transient_play_mode, TransientPlayMode::Once,
+        "a transient-play-mode edit updates the region live after a live play-mode switch");
+    unsubscribe_audio_region(&mut engine.graph, binding);
+}
+
+#[test]
 fn read_audio_region_converts_seconds_time_base_to_ppqn() {
     // A no-stretch (NoWarp) region uses the SECONDS time-base: duration / loop-duration are in seconds and
     // MUST be converted to ppqn, else the region reads as a few pulses and plays nothing (the bug).
@@ -850,6 +959,82 @@ fn a_tape_instrument_unit_builds_the_audio_region_player() {
     engine.reconcile_one(&mut unit);
     assert!(matches!(unit.wired, Some(Wired::Tape(_))), "a TapeDeviceBox instrument builds the audio-region player -> strip -> master");
     assert_eq!(unit.audio_track_sets.borrow()[0].borrow().regions.len(), 1, "the player reads the unit's audio region");
+}
+
+#[test]
+fn an_armed_tape_meters_and_carries_the_monitored_live_input() {
+    // The armed tape sums its staged live input into its own output: the tape device meters it (a peak
+    // shows) and a side-chain tapping the tape device (e.g. a vocoder modulator) receives it. Regression
+    // for "monitoring with effects gives the tape device no signal / no peak".
+    use crate::monitor::MonitorEntry;
+    const TAPE: Uuid = [55u8; 16];
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(TAPE, "TapeDeviceBox", &[(HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))]),
+    ]);
+    let quantum = engine_env::RENDER_QUANTUM;
+    {
+        let staging = unsafe { crate::MONITOR_INPUT.get() };
+        for sample in staging.iter_mut() {*sample = 0.0;}
+        for index in 0..quantum {
+            staging[index] = 0.5;
+            staging[quantum + index] = 0.5;
+        }
+    }
+    engine.monitoring_map = alloc::vec![MonitorEntry {uuid: UNIT, left: 0, right: 1}];
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    engine.context.process(&engine_env::process_info::ProcessInfo {blocks: &[]});
+    match unit.wired.as_ref().expect("wired") {
+        Wired::Tape(tape) => {
+            let output = tape.player.borrow().audio_output();
+            assert!((0..quantum).all(|index| (output.borrow().left[index] - 0.5).abs() < 1e-6),
+                "the tape device output (its side-chain tap) carries the monitored live input");
+            assert!(tape.player.borrow().meter_slot().borrow()[0] > 0.0,
+                "the tape device meters the monitored live input (peak L)");
+        }
+        _ => panic!("expected a tape unit")
+    }
+}
+
+#[test]
+fn arming_a_tape_drops_the_old_player_so_its_meter_re_registers() {
+    // Regression for "the tape device meter freezes when arming + monitoring": setting the monitoring map
+    // rewires the unit; the rebuild must DROP the old player so its (now stale) meter slot dies and the fresh
+    // meter registers instead of being dedup-skipped. The old player leaked through its unsubscribed `enabled`
+    // observer's captured Rc, so the UI kept reading the old, no-longer-processed slot — frozen.
+    use crate::monitor::MonitorEntry;
+    use alloc::rc::Weak;
+    const TAPE: Uuid = [55u8; 16];
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(TAPE, "TapeDeviceBox", &[(HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))]),
+    ]);
+    engine.unit_changes.borrow_mut().added.push(UNIT);
+    engine.reconcile_units();
+    let old_player: Weak<_> = match engine.audio_units.iter().find(|u| u.unit == UNIT)
+        .and_then(|u| u.wired.as_ref()).expect("wired") {
+        Wired::Tape(tape) => alloc::rc::Rc::downgrade(&tape.player),
+        _ => panic!("expected a tape unit")
+    };
+    engine.set_monitoring_map(alloc::vec![MonitorEntry {uuid: UNIT, left: 0, right: 1}]); // arm+monitor -> rewire
+    engine.broadcasts.sweep();
+    assert!(old_player.upgrade().is_none(),
+        "arming rewires the tape and drops the old player (its enabled observer is unsubscribed)");
+    let alive_meters = (0..engine.broadcasts.len()).filter(|index| {
+        let entry = engine.broadcasts.entry(*index).expect("entry");
+        entry.uuid == TAPE && entry.keys.is_empty()
+            && entry.package_type == crate::broadcast::PACKAGE_FLOAT_ARRAY && entry.alive()
+    }).count();
+    assert_eq!(alive_meters, 1, "exactly one alive tape-device meter after arming (the fresh one, not the frozen old)");
 }
 
 // ---- Composite per-child lifecycle ----
@@ -1239,6 +1424,100 @@ fn solo_forces_other_strips_silent_keeping_the_output_bus_audible() {
 }
 
 #[test]
+fn an_automated_solo_curve_forces_other_strips_silent() {
+    // #305 (solo half): a Value track automating UNIT A's solo (key 15) must silence the non-soloed unit C while
+    // playing, exactly like a manual solo. Solo is engine-level, so `resolve_automated_solo` writes the curve's
+    // on/off into A's static solo cell and re-runs `update_solo`. Before the fix the curve was never bound.
+    use super::{UNIT_SOLO_KEY, UNIT_OUTPUT_KEY, BUS_ENABLED_KEY};
+    const UNIT_A: Uuid = [70u8; 16];
+    const INSTR_A: Uuid = [71u8; 16];
+    const UNIT_C: Uuid = [72u8; 16];
+    const INSTR_C: Uuid = [73u8; 16];
+    const BUS_UNIT: Uuid = [74u8; 16];
+    const BUS_BOX: Uuid = [75u8; 16];
+    const VTRACK: Uuid = [76u8; 16];
+    const VREGION: Uuid = [77u8; 16];
+    const VCOLL: Uuid = [78u8; 16];
+    const VEVENT: Uuid = [79u8; 16];
+    let unit_fields = || alloc::vec![
+        (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+        (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook),
+        (UNIT_SOLO_KEY, FieldValue::Boolean(false))
+    ];
+    let mut engine = engine_with_devices();
+    let mut a_fields = unit_fields();
+    a_fields.push((UNIT_OUTPUT_KEY, FieldValue::Pointer(Some(Address::of(BUS_BOX, vec![6]))))); // A -> the bus input
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(UNIT_A, "AudioUnitBox", &a_fields),
+        graph_box(INSTR_A, "TestInstrument", &[(HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT_A, vec![UNIT_INPUT_KEY]))))]),
+        graph_box(UNIT_C, "AudioUnitBox", &unit_fields()),
+        graph_box(INSTR_C, "TestInstrument", &[(HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT_C, vec![UNIT_INPUT_KEY]))))]),
+        graph_box(BUS_UNIT, "AudioUnitBox", &unit_fields()),
+        graph_box(BUS_BOX, "AudioBusBox", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(BUS_UNIT, vec![UNIT_INPUT_KEY])))),
+            (6, FieldValue::Hook),
+            (BUS_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        // A Value track automating UNIT A's solo, one event at 1.0 (soloed) covering the region.
+        graph_box(VTRACK, "TrackBox", &[
+            (2, FieldValue::Pointer(Some(Address::of(UNIT_A, vec![UNIT_SOLO_KEY])))),
+            (3, FieldValue::Hook)
+        ]),
+        graph_box(VREGION, "ValueRegionBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(VTRACK, vec![3])))),
+            (2, FieldValue::Pointer(Some(Address::of(VCOLL, vec![2])))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Int32(3840)), (12, FieldValue::Int32(0)), (13, FieldValue::Int32(3840))
+        ]),
+        graph_box(VCOLL, "ValueEventCollectionBox", &[(1, FieldValue::Hook), (2, FieldValue::Hook)]),
+        graph_box(VEVENT, "ValueEventBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(VCOLL, vec![1])))), (10, FieldValue::Int32(0)), (13, FieldValue::Float32(1.0))
+        ])
+    ]);
+    for uuid in [BUS_UNIT, UNIT_A, UNIT_C] {
+        let mut unit = engine.build_unit(uuid);
+        engine.reconcile_one(&mut unit); // binds A's solo automation curve (first reconcile)
+        engine.audio_units.push(unit);
+    }
+    engine.resolve_outputs();
+    let params_of = |engine: &Engine, uuid: Uuid| engine.audio_units.iter()
+        .find(|unit| unit.unit == uuid).expect("unit").strip_params.clone();
+    // Nothing is statically soloed yet, so every strip is audible.
+    engine.update_solo();
+    assert!(!params_of(&engine, UNIT_C).forced_silent.get(), "no solo yet: C is audible");
+    // Resolve the automation at a position the curve covers: A becomes soloed, silencing C, A + its bus stay audible.
+    engine.resolve_automated_solo(0.0);
+    assert!(params_of(&engine, UNIT_A).solo.get(), "the solo curve (event 1.0) wrote the unit's solo cell");
+    assert!(!params_of(&engine, UNIT_A).forced_silent.get(), "the automation-soloed unit stays audible");
+    assert!(params_of(&engine, UNIT_C).forced_silent.get(), "a non-soloed unit is forced silent by the automated solo");
+    assert!(!params_of(&engine, BUS_UNIT).forced_silent.get(), "the soloed unit's output bus stays audible");
+}
+
+#[test]
+fn detaching_solo_automation_restores_the_static_solo_cell_from_the_field() {
+    // `resolve_automated_solo` writes the solo curve's value into the static solo cell. Detaching the automation
+    // (a rebind that finds no track) must restore that cell from the FIELD — the field subscription only fires on a
+    // field edit, not on a track detach — else the unit would stay soloed forever after its automation is removed.
+    use super::UNIT_SOLO_KEY;
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook), (UNIT_INPUT_KEY, FieldValue::Hook),
+            (UNIT_AUDIO_KEY, FieldValue::Hook), (UNIT_SOLO_KEY, FieldValue::Boolean(false))
+        ]),
+        graph_box(INSTR, "TestInstrument", &[(HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))])
+    ]);
+    let mut unit = engine.build_unit(UNIT);
+    engine.bind_strip_automation(&mut unit); // no solo track attached
+    // Simulate a prior `resolve_automated_solo` having left the cell hot (soloed), diverging from the field (false).
+    unit.strip_params.solo.set(true);
+    engine.solo_dirty.set(false);
+    engine.bind_strip_automation(&mut unit); // rebind with no track -> restore from the field
+    assert!(!unit.strip_params.solo.get(), "detach restored the static solo cell from the field (false)");
+    assert!(engine.solo_dirty.get(), "detach re-armed the solo resolution so forced_silent reverts");
+    engine.teardown_unit(unit);
+}
+
+#[test]
 fn an_automated_parameter_broadcasts_its_unit_value_at_its_field_address() {
     const VTRACK: Uuid = [45u8; 16];
     const VREGION: Uuid = [46u8; 16];
@@ -1289,6 +1568,68 @@ fn an_automated_parameter_broadcasts_its_unit_value_at_its_field_address() {
         entry.uuid == UNIT && entry.keys == vec![UNIT_VOLUME_KEY]
     });
     assert!(!still_there, "detaching the track unregisters the parameter broadcast");
+}
+
+#[test]
+fn a_device_param_automation_rebind_keeps_its_ui_broadcast_alive() {
+    // A device param's automated value drives a UI broadcast at its field address (the knob animates). Every
+    // automation edit re-observes the device's params (rebind_one). rebind_one held the OLD handles + the device
+    // pull alive while re-registering, so the register dedup treated the outgoing slot as the winner and SKIPPED
+    // the new one; the sweep then dropped the stale slot, leaving NO live broadcast — the knob froze while audio
+    // kept updating (audio reads the handle directly). A fresh load registered once cleanly, which is why
+    // save+load "fixed" it. The rebind must leave a LIVE broadcast matching the current handle's slot.
+    use super::{DeviceParams, ParamNode};
+    const DEV: Uuid = [80u8; 16];
+    const TRACK: Uuid = [81u8; 16];
+    const REGION: Uuid = [82u8; 16];
+    const COL: Uuid = [83u8; 16];
+    const EVENT: Uuid = [84u8; 16];
+    const PATH: u16 = 11;
+    let mut engine = engine_with_devices();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(DEV, "TestEffect", &[(PATH, FieldValue::Float32(0.0))]),
+        graph_box(TRACK, "TrackBox", &[
+            (2, FieldValue::Pointer(Some(Address::of(DEV, vec![PATH])))),
+            (3, FieldValue::Hook)
+        ]),
+        graph_box(REGION, "ValueRegionBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(TRACK, vec![3])))),
+            (2, FieldValue::Pointer(Some(Address::of(COL, vec![2])))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Int32(3840)),
+            (12, FieldValue::Int32(0)), (13, FieldValue::Int32(3840))
+        ]),
+        graph_box(COL, "ValueEventCollectionBox", &[(1, FieldValue::Hook), (2, FieldValue::Hook)]),
+        graph_box(EVENT, "ValueEventBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(COL, vec![1])))),
+            (10, FieldValue::Int32(0)), (13, FieldValue::Float32(0.75))
+        ])
+    ]);
+    let invalidate: Rc<dyn Fn()> = Rc::new(|| {});
+    let (handles, field_subs, collections, _armed) = engine.observe_params(DEV, &[alloc::vec![PATH]], &invalidate);
+    struct StubSink;
+    impl crate::param_automation::ParamSink for StubSink {
+        fn set_params(&mut self, _: alloc::vec::Vec<crate::param_automation::ParamHandle>, _: bool) {}
+        fn state_ptr(&self) -> u32 { 0 }
+    }
+    let mut params = DeviceParams {
+        device_uuid: DEV, reg: stub_device(DEVICE_KIND_AUDIO_EFFECT), state_ptr: 0,
+        sink: ParamNode::Audio(Rc::new(RefCell::new(StubSink))),
+        paths: alloc::vec![alloc::vec![PATH]], handles, field_subs, collections,
+        observe_subs: Vec::new(), pointer_field_subs: Vec::new(), sidechain_paths: Vec::new(),
+        param_hub_sub: None, sample_hub_sub: None, broadcast_slots: Vec::new()
+    };
+    let entry_ptr = |engine: &Engine| (0..engine.broadcasts.len()).find_map(|index| {
+        let entry = engine.broadcasts.entry(index).expect("entry");
+        (entry.uuid == DEV && entry.keys == vec![PATH] && entry.package_type == crate::broadcast::PACKAGE_FLOAT && entry.alive())
+            .then_some(entry.ptr)
+    });
+    assert!(entry_ptr(&engine).is_some(), "initial bind registers a live broadcast at the param address");
+    // An automation edit re-observes the params. The UI broadcast must stay live AND point at the CURRENT slot.
+    engine.rebind_one(&mut params, &invalidate, 0.0);
+    engine.broadcasts.sweep();
+    let live = entry_ptr(&engine).expect("the rebind leaves a LIVE broadcast at the param address");
+    let handle_ptr = params.handles[0].broadcast.as_ref().expect("automated handle has a slot").borrow().as_ptr() as u32;
+    assert_eq!(live, handle_ptr, "the live broadcast matches the current handle's slot, not a stale dead one");
 }
 
 #[test]
@@ -1521,47 +1862,112 @@ fn a_field_edit_raises_the_light_signal_and_an_attach_the_heavy_one() {
 }
 
 #[test]
-fn an_output_fx_param_edit_delivers_through_reconcile() {
-    // The master/output unit's fx chain is built statically (not a reconciled unit), so a knob edit on a
-    // master effect can't ride a unit reconcile. `output_strip` binds each with an invalidate that flags
-    // `output_params_dirty`, and `reconcile_units` re-pushes the changed values. This pins that path end to
-    // end: an edit on an output-fx param must reach the device (its handle's `last` advancing proves the
-    // `refresh_params` delivery ran). A regression here is the "master Maximizer threshold does nothing" bug.
-    const FX: Uuid = [50u8; 16];
+fn adding_an_effect_to_the_output_unit_wires_it_live() {
+    // The output unit is structurally a terminal bus (sum -> fx -> strip): it must reconcile like any bus so a
+    // LIVE effect add is wired into the running master chain, not silently dropped until the next save + reload.
+    // Regression for "a compressor/gate added to the master output does nothing until reload".
+    use super::{UNIT_OUTPUT_KEY, BUS_ENABLED_KEY};
+    let _ = UNIT_OUTPUT_KEY;
+    const OUT_UNIT: Uuid = [70u8; 16];
+    const OUT_BUS: Uuid = [71u8; 16];
+    const FX: Uuid = [72u8; 16];
+    const TYPE_KEY: u16 = 1; // AudioUnitBox `type`; "output" marks THE terminal master unit
     let mut engine = engine_with_devices();
     engine.graph = BoxGraph::from_boxes(vec![
-        graph_box(FX, "TestEffect", &[(11, FieldValue::Float32(0.0))])
+        graph_box(OUT_UNIT, "AudioUnitBox", &[
+            (TYPE_KEY, FieldValue::String("output".into())),
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(OUT_BUS, "AudioBusBox", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(OUT_UNIT, vec![UNIT_INPUT_KEY])))),
+            (6, FieldValue::Hook),
+            (BUS_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        graph_box(FX, "TestEffect", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(OUT_UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0))
+        ])
     ]);
-    // Observe the param exactly as `output_strip` does: with the `output_params_dirty` invalidate, and NO
-    // params signal set (so a later field edit falls back to that invalidate — the output-unit case).
-    let invalidate: Rc<dyn Fn()> = {
-        let dirty = engine.output_params_dirty.clone();
-        Rc::new(move || dirty.set(true))
-    };
-    let (handle, subs, collections, _) = engine.observe_param(FX, &[11], 0, &invalidate);
-    let last_probe = handle.last.clone();
-    struct StubSink;
-    impl crate::param_automation::ParamSink for StubSink {
-        fn set_params(&mut self, _: alloc::vec::Vec<crate::param_automation::ParamHandle>, _: bool) {}
-        fn state_ptr(&self) -> u32 {0}
-    }
-    engine.output_device_params.push(DeviceParams {
-        device_uuid: FX, reg: stub_device(DEVICE_KIND_AUDIO_EFFECT), state_ptr: 0,
-        sink: ParamNode::Audio(Rc::new(RefCell::new(StubSink))),
-        paths: alloc::vec![alloc::vec![11]], handles: alloc::vec![handle], field_subs: subs, collections,
-        observe_subs: Vec::new(), pointer_field_subs: Vec::new(), sidechain_paths: Vec::new(),
-        param_hub_sub: None, sample_hub_sub: None, broadcast_slots: Vec::new()
-    });
-    // The observe catch-up already fired the flag + set the cell to the current value; clear so only the EDIT counts.
-    engine.output_params_dirty.set(false);
-    engine.graph.transaction(&[Update::Primitive {
-        address: Address::of(FX, vec![11]),
-        old: FieldValue::Float32(0.0), new: FieldValue::Float32(-12.0)
-    }], &engine.registry).expect("threshold edit");
-    assert!(engine.output_params_dirty.get(), "an output-fx param edit flags output_params_dirty");
+    // Drive the production reconcile loop: the output unit enters via the audio-units membership add.
+    engine.unit_changes.borrow_mut().added.push(OUT_UNIT);
     engine.reconcile_units();
-    assert_eq!(last_probe.get(), -12.0, "reconcile re-pushes the edited value to the output-fx device");
-    assert!(!engine.output_params_dirty.get(), "the dirty flag is consumed");
+    let unit = engine.audio_units.iter().find(|unit| unit.unit == OUT_UNIT)
+        .expect("the output unit reconciles like a normal bus unit (not a static singleton)");
+    match unit.wired.as_ref().expect("wired after reconcile") {
+        Wired::Bus(bus) => {
+            // The master sum is shared (`sum_node` is None so a teardown never removes it); the live-added
+            // effect is a chain member wired between the shared sum and the strip.
+            assert!(bus.sum_node.is_none(), "the output unit reuses the shared master sum");
+            assert_eq!(bus.audio.len(), 1, "the live-added output effect is built into the chain");
+            assert!(bus.edges.len() >= 2, "the effect + strip are wired ({} edges)", bus.edges.len());
+        }
+        _ => panic!("expected the output unit to reconcile as a Bus")
+    }
+    // And the terminal wiring: `render` reads the output unit's strip output, not the raw master sum.
+    assert!(engine.output_bus.is_some(), "the output unit republished its strip as the render buffer");
+}
+
+#[test]
+fn an_effect_composite_on_the_output_unit_is_realized() {
+    // A bus / output chain must build composites through the same member path as every other chain.
+    // Regression for "a Frequency Split added to the output bus is inert: no spectrum, band solo does nothing"
+    // — the old bus builder resolved plugin effects only and silently skipped composite boxes.
+    use super::BUS_ENABLED_KEY;
+    const OUT_UNIT: Uuid = [80u8; 16];
+    const OUT_BUS: Uuid = [81u8; 16];
+    const BUS_COMP: Uuid = [82u8; 16];
+    const BUS_ENTRY: Uuid = [83u8; 16];
+    const TYPE_KEY: u16 = 1;
+    let mut engine = engine_with_composite();
+    engine.graph = BoxGraph::from_boxes(vec![
+        graph_box(OUT_UNIT, "AudioUnitBox", &[
+            (TYPE_KEY, FieldValue::String("output".into())),
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(OUT_BUS, "AudioBusBox", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(OUT_UNIT, vec![UNIT_INPUT_KEY])))),
+            (6, FieldValue::Hook),
+            (BUS_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        graph_box(BUS_COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(OUT_UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook),
+            (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)),
+            (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        graph_box(BUS_ENTRY, "TestCompositeCell", &[
+            (ENTRY_COMPOSITE_KEY, FieldValue::Pointer(Some(Address::of(BUS_COMP, vec![ENTRIES_FIELD])))),
+            (ENTRY_CHAIN_FIELD, FieldValue::Hook),
+            (ENTRY_INDEX_KEY, FieldValue::Int32(0)),
+            (ENTRY_LABEL_KEY, FieldValue::String("A".to_string())),
+            (ENTRY_GAIN_KEY, FieldValue::Float32(0.0)),
+            (ENTRY_PAN_KEY, FieldValue::Float32(0.0)),
+            (ENTRY_MUTE_KEY, FieldValue::Boolean(false)),
+            (ENTRY_SOLO_KEY, FieldValue::Boolean(false))
+        ])
+    ]);
+    engine.unit_changes.borrow_mut().added.push(OUT_UNIT);
+    engine.reconcile_units();
+    let unit = engine.audio_units.iter().find(|unit| unit.unit == OUT_UNIT).expect("output unit");
+    match unit.wired.as_ref().expect("wired after reconcile") {
+        Wired::Bus(bus) => {
+            assert_eq!(bus.audio.len(), 1, "the composite is built into the master chain");
+            let member = &bus.audio[0];
+            assert!(matches!(member.proc, ProcHandle::EffectComposite(_)),
+                "the member is the realized composite, not silently skipped");
+            assert!(member.input_node.is_some(), "the chain enters at the composite's distributor");
+            assert!(bus.edges.len() >= 2, "sum -> composite -> strip are wired ({} edges)", bus.edges.len());
+            if let ProcHandle::EffectComposite(binding) = &member.proc {
+                assert_eq!(binding.entry_count(), 1, "the composite's entry is built");
+            }
+        }
+        _ => panic!("expected the output unit to reconcile as a Bus")
+    }
 }
 
 #[test]
@@ -1713,6 +2119,51 @@ fn rebinding_strip_automation_does_not_leak_subscriptions() {
 }
 
 #[test]
+fn a_value_track_on_the_mute_field_installs_the_strip_mute_automation() {
+    // #305: a Value track targeting the UNIT's mute (key 14) must install the strip's mute automation source, so an
+    // automated mute is applied (and broadcast to the UI). Before the fix `bind_strip_automation` only observed
+    // volume/panning, so the mute curve was never bound and the automation did nothing.
+    const VTRACK: Uuid = [30u8; 16];
+    const VREGION: Uuid = [31u8; 16];
+    const VCOLL: Uuid = [32u8; 16];
+    const VEVENT: Uuid = [33u8; 16];
+    let mut engine = engine_with_devices();
+    let mut boxes = vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook), (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ])
+    ];
+    boxes.extend(vec![
+        graph_box(VTRACK, "TrackBox", &[
+            (2, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_MUTE_KEY])))),
+            (3, FieldValue::Hook)
+        ]),
+        graph_box(VREGION, "ValueRegionBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(VTRACK, vec![3])))),
+            (2, FieldValue::Pointer(Some(Address::of(VCOLL, vec![2])))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Int32(3840)), (12, FieldValue::Int32(0)), (13, FieldValue::Int32(3840))
+        ]),
+        graph_box(VCOLL, "ValueEventCollectionBox", &[(1, FieldValue::Hook), (2, FieldValue::Hook)]),
+        graph_box(VEVENT, "ValueEventBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(VCOLL, vec![1])))), (10, FieldValue::Int32(0)), (13, FieldValue::Float32(1.0))
+        ])
+    ]);
+    engine.graph = BoxGraph::from_boxes(boxes);
+    let mut unit = engine.build_unit(UNIT);
+    engine.bind_strip_automation(&mut unit);
+    let muted_at_zero = {
+        let mute_source = unit.strip_automation.mute.borrow();
+        let mute_source = mute_source.as_ref().expect("a mute value track installs the strip mute automation source");
+        mute_source(0.0) >= 0.5
+    };
+    assert!(muted_at_zero, "the mute curve (event 1.0) resolves to muted at position 0");
+    engine.teardown_unit(unit);
+}
+
+#[test]
 fn update_positions_gate_on_transporting_blocks() {
     // TS `UpdateClock.process` skips a block without `BlockFlag.transporting`: a PAUSED quantum (the
     // free-running block whose pulse range keeps advancing at a non-song position) must yield NO update
@@ -1743,4 +2194,913 @@ fn update_positions_gate_on_transporting_blocks() {
         pull.blocks = core::ptr::null();
         pull.block_count = 0;
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// EFFECT COMPOSITES: a parallel FX stack as ONE member of an audio chain.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const COMP: Uuid = [20u8; 16];
+const ENTRY_A: Uuid = [21u8; 16];
+const ENTRY_B: Uuid = [22u8; 16];
+const ENTRY_C: Uuid = [23u8; 16];
+const ENTRY_D: Uuid = [24u8; 16];
+const NESTED_A: Uuid = [23u8; 16];
+const NESTED_B: Uuid = [24u8; 16];
+
+// The registered field keys, mirroring EFFECT_COMPOSITES in core-wasm/src/engine-modules.ts.
+const ENTRIES_FIELD: u16 = 10;
+const INPUT_TAP_FIELD: u16 = 11;
+const DRY_KEY: u16 = 12;
+const WET_KEY: u16 = 13;
+const CROSSOVER1_KEY: u16 = 14;
+const CROSSOVER2_KEY: u16 = 15;
+const CROSSOVER3_KEY: u16 = 16;
+const ENTRY_INDEX_KEY: u16 = 3;
+const ENTRY_CHAIN_FIELD: u16 = 2;
+const ENTRY_LABEL_KEY: u16 = 4;
+const ENTRY_GAIN_KEY: u16 = 40;
+const ENTRY_PAN_KEY: u16 = 43;
+const ENTRY_MUTE_KEY: u16 = 41;
+const ENTRY_SOLO_KEY: u16 = 42;
+const ENTRY_COMPOSITE_KEY: u16 = 1; // the entry's mandatory `composite` pointer
+
+fn engine_with_composite() -> Engine {
+    let mut engine = engine_with_devices();
+    engine.register_effect_composite("TestComposite".to_string(), DEVICE_KIND_AUDIO_EFFECT as u8,
+        crate::Distributor::Broadcast, ENTRIES_FIELD, ENTRY_INDEX_KEY, ENTRY_CHAIN_FIELD, ENTRY_LABEL_KEY,
+        ENTRY_GAIN_KEY, ENTRY_PAN_KEY, ENTRY_MUTE_KEY, ENTRY_SOLO_KEY, DRY_KEY, WET_KEY, INPUT_TAP_FIELD,
+        [0, 0, 0]);
+    engine
+}
+
+fn entry_box(uuid: Uuid, index: i32, label: &str) -> GraphBox {
+    graph_box(uuid, "TestCompositeCell", &[
+        (ENTRY_COMPOSITE_KEY, FieldValue::Pointer(Some(Address::of(COMP, vec![ENTRIES_FIELD])))),
+        (ENTRY_CHAIN_FIELD, FieldValue::Hook),
+        (ENTRY_INDEX_KEY, FieldValue::Int32(index)),
+        (ENTRY_LABEL_KEY, FieldValue::String(label.to_string())),
+        (ENTRY_GAIN_KEY, FieldValue::Float32(0.0)),
+        (ENTRY_PAN_KEY, FieldValue::Float32(0.0)),
+        (ENTRY_MUTE_KEY, FieldValue::Boolean(false)),
+        (ENTRY_SOLO_KEY, FieldValue::Boolean(false))
+    ])
+}
+
+// A unit whose audio chain holds ONE composite (index 0) with two entries; entry A holds one nested
+// effect, entry B is empty (an identity branch). NESTED_B exists but is unattached, so it can join later.
+fn fx_composite_graph() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook),
+            (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)),
+            (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        entry_box(ENTRY_A, 0, "A"),
+        entry_box(ENTRY_B, 1, "B"),
+        graph_box(NESTED_A, "TestEffect", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(ENTRY_A, vec![ENTRY_CHAIN_FIELD])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        graph_box(NESTED_B, "TestEffect", &[
+            (HOST_KEY, FieldValue::Pointer(None)),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true))
+        ])
+    ])
+}
+
+// The composite binding of the unit's first audio member.
+fn composite_of(unit: &AudioUnitBinding) -> &crate::effect_composite::EffectCompositeBinding {
+    match unit.wired.as_ref().expect("wired after reconcile") {
+        Wired::Leaf(chain) => match &chain.audio.first().expect("a composite member").proc {
+            ProcHandle::EffectComposite(binding) => binding,
+            _ => panic!("expected the audio member to be an effect composite")
+        },
+        _ => panic!("expected a leaf chain")
+    }
+}
+
+#[test]
+fn a_composite_joins_an_audio_chain_as_one_member_wired_distributor_in_mix_out() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (instr_node, audio) = leaf_nodes(&unit);
+    assert_eq!(audio.len(), 1, "the whole stack is ONE member of the unit chain");
+    let (distributor, mix) = {
+        let binding = composite_of(&unit);
+        assert_eq!(binding.entry_count(), 2, "both entries built");
+        (binding.distributor_id, binding.mix_id)
+    };
+    assert_eq!(audio[0], mix, "the chain continues from the composite's MIX");
+    // The upstream must feed the DISTRIBUTOR, not the mix: that is what `input_node` expresses.
+    let edges = leaf_edges(&unit);
+    assert!(edges.contains(&(instr_node, distributor)),
+        "the instrument feeds the composite's distributor");
+    assert!(!edges.contains(&(instr_node, mix)), "and NOT its mix");
+}
+
+#[test]
+fn an_entry_join_keeps_every_surviving_processor_and_the_composite_s_own_nodes() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (distributor_before, mix_before, chain_a_before) = {
+        let binding = composite_of(&unit);
+        (binding.distributor_id, binding.mix_id, binding.entry_chain_len(ENTRY_A).expect("entry A"))
+    };
+    assert_eq!(chain_a_before, 1, "entry A holds one nested effect");
+    assert_eq!(composite_of(&unit).entry_chain_len(ENTRY_B), Some(0), "entry B is an identity branch");
+    // Attach NESTED_B into entry B's chain through a real transaction.
+    let connect = Update::Pointer {
+        address: Address::of(NESTED_B, vec![HOST_KEY]),
+        old: None,
+        new: Some(Address::of(ENTRY_B, vec![ENTRY_CHAIN_FIELD]))
+    };
+    engine.graph.transaction(&[connect], &engine.registry).expect("connect NESTED_B");
+    engine.reconcile_one(&mut unit);
+    let binding = composite_of(&unit);
+    assert_eq!(binding.entry_chain_len(ENTRY_B), Some(1), "entry B took the joiner");
+    assert_eq!(binding.entry_chain_len(ENTRY_A), Some(1), "entry A is untouched");
+    // The composite's OWN nodes persist, so the unit chain around it is never re-wired.
+    assert_eq!(binding.distributor_id, distributor_before, "the distributor persists across an entry edit");
+    assert_eq!(binding.mix_id, mix_before, "and so does the mix");
+}
+
+#[test]
+fn muting_an_entry_silences_only_that_entry() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    assert_eq!(composite_of(&unit).entry_silent(ENTRY_A), Some(false), "nothing is silent initially");
+    let mute = Update::Primitive {
+        address: Address::of(ENTRY_A, vec![ENTRY_MUTE_KEY]),
+        old: FieldValue::Boolean(false),
+        new: FieldValue::Boolean(true)
+    };
+    engine.graph.transaction(&[mute], &engine.registry).expect("mute entry A");
+    engine.reconcile_one(&mut unit);
+    let binding = composite_of(&unit);
+    assert_eq!(binding.entry_silent(ENTRY_A), Some(true), "the muted entry is silent");
+    assert_eq!(binding.entry_silent(ENTRY_B), Some(false), "its sibling is untouched");
+}
+
+// A pure REORDER (swap two entries' index fields, no chain change) must re-point each survivor onto its new
+// distributor branch. Broadcast makes this audibly a no-op, but a positional distributor (a stereo split) reads
+// the branch by position, so a survivor left on its old branch would silently swap the channels.
+#[test]
+fn reordering_entries_rewires_each_to_its_new_branch() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    assert_eq!(composite_of(&unit).entry_branch(ENTRY_A), Some(0), "A starts on branch 0");
+    assert_eq!(composite_of(&unit).entry_branch(ENTRY_B), Some(1), "B starts on branch 1");
+    let swap = [
+        Update::Primitive {
+            address: Address::of(ENTRY_A, vec![ENTRY_INDEX_KEY]),
+            old: FieldValue::Int32(0), new: FieldValue::Int32(1)
+        },
+        Update::Primitive {
+            address: Address::of(ENTRY_B, vec![ENTRY_INDEX_KEY]),
+            old: FieldValue::Int32(1), new: FieldValue::Int32(0)
+        }
+    ];
+    engine.graph.transaction(&swap, &engine.registry).expect("swap entry order");
+    engine.reconcile_one(&mut unit);
+    let binding = composite_of(&unit);
+    assert_eq!(binding.entry_branch(ENTRY_A), Some(1), "A moved to branch 1");
+    assert_eq!(binding.entry_branch(ENTRY_B), Some(0), "B moved to branch 0");
+    assert_eq!(binding.entry_count(), 2, "both entries survived the reorder");
+}
+
+#[test]
+fn soloing_one_entry_silences_every_sibling() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let solo = Update::Primitive {
+        address: Address::of(ENTRY_B, vec![ENTRY_SOLO_KEY]),
+        old: FieldValue::Boolean(false),
+        new: FieldValue::Boolean(true)
+    };
+    engine.graph.transaction(&[solo], &engine.registry).expect("solo entry B");
+    engine.reconcile_one(&mut unit);
+    {
+        let binding = composite_of(&unit);
+        // Solo is a CROSS-entry fact, exactly like the mixer's: it silences the OTHERS.
+        assert_eq!(binding.entry_silent(ENTRY_B), Some(false), "the soloed entry plays");
+        assert_eq!(binding.entry_silent(ENTRY_A), Some(true), "its non-soloed sibling is silenced");
+    }
+    // Un-soloing restores every sibling.
+    let unsolo = Update::Primitive {
+        address: Address::of(ENTRY_B, vec![ENTRY_SOLO_KEY]),
+        old: FieldValue::Boolean(true),
+        new: FieldValue::Boolean(false)
+    };
+    engine.graph.transaction(&[unsolo], &engine.registry).expect("un-solo entry B");
+    engine.reconcile_one(&mut unit);
+    assert_eq!(composite_of(&unit).entry_silent(ENTRY_A), Some(false), "un-solo restores the sibling");
+}
+
+// A composite with two EMPTY entries (identity branches) whose gains differ, so the two are separable in the
+// rendered mix. Dry is off and wet at unity, so the output is exactly the entry strips' sum.
+fn entry_box_gain(uuid: Uuid, index: i32, label: &str, gain_db: f32) -> GraphBox {
+    graph_box(uuid, "TestCompositeCell", &[
+        (ENTRY_COMPOSITE_KEY, FieldValue::Pointer(Some(Address::of(COMP, vec![ENTRIES_FIELD])))),
+        (ENTRY_CHAIN_FIELD, FieldValue::Hook),
+        (ENTRY_INDEX_KEY, FieldValue::Int32(index)),
+        (ENTRY_LABEL_KEY, FieldValue::String(label.to_string())),
+        (ENTRY_GAIN_KEY, FieldValue::Float32(gain_db)),
+        (ENTRY_PAN_KEY, FieldValue::Float32(0.0)),
+        (ENTRY_MUTE_KEY, FieldValue::Boolean(false)),
+        (ENTRY_SOLO_KEY, FieldValue::Boolean(false))
+    ])
+}
+
+fn fx_render_graph(gain_a_db: f32, gain_b_db: f32) -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook),
+            (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)),
+            (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        entry_box_gain(ENTRY_A, 0, "A", gain_a_db),
+        entry_box_gain(ENTRY_B, 1, "B", gain_b_db)
+    ])
+}
+
+// Feed a DC of 1.0 straight into the distributor (reconcile re-points it at the silent stub instrument, so
+// this is re-applied every call) and render enough quanta for the strip de-click ramps to settle; return the
+// composite's steady-state mix output.
+fn render_mix(engine: &mut Engine, unit: &AudioUnitBinding) -> (f32, f32) {
+    let dc = shared_audio_buffer();
+    {
+        let mut buffer = dc.borrow_mut();
+        for index in 0..engine_env::RENDER_QUANTUM {
+            buffer.left[index] = 1.0;
+            buffer.right[index] = 1.0;
+        }
+    }
+    composite_of(unit).set_audio_source(dc);
+    let block = abi::Block {index: 0, flags: abi::BlockFlags::create(true, false, false, false),
+        p0: 0.0, p1: 1.0, s0: 0, s1: engine_env::RENDER_QUANTUM as u32, bpm: 120.0};
+    for _ in 0..16 {
+        engine.context.process(&engine_env::process_info::ProcessInfo {blocks: &[block]});
+    }
+    let out = composite_of(unit).mix_output.borrow();
+    (out.left[0], out.right[0])
+}
+
+fn set_bool(engine: &mut Engine, uuid: Uuid, key: u16, from: bool, to: bool) {
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(uuid, vec![key]),
+        old: FieldValue::Boolean(from), new: FieldValue::Boolean(to)
+    }], &engine.registry).expect("toggle bool field");
+}
+
+// Render through the PRODUCTION reconcile loop: the unit lives in `engine.audio_units` and a field edit must
+// enqueue it into `dirty_units` for `reconcile_units` to pick up — exactly the live path (a manual
+// `reconcile_one` bypasses that enqueue). Returns the composite's steady-state mix output.
+fn render_mix_live(engine: &mut Engine, unit_uuid: Uuid) -> (f32, f32) {
+    let dc = shared_audio_buffer();
+    {
+        let mut buffer = dc.borrow_mut();
+        for index in 0..engine_env::RENDER_QUANTUM {
+            buffer.left[index] = 1.0;
+            buffer.right[index] = 1.0;
+        }
+    }
+    let mix_output = {
+        let unit = engine.audio_units.iter().find(|binding| binding.unit == unit_uuid).expect("unit");
+        let composite = composite_of(unit);
+        composite.set_audio_source(dc);
+        composite.mix_output.clone()
+    };
+    let block = abi::Block {index: 0, flags: abi::BlockFlags::create(true, false, false, false),
+        p0: 0.0, p1: 1.0, s0: 0, s1: engine_env::RENDER_QUANTUM as u32, bpm: 120.0};
+    for _ in 0..16 {
+        engine.context.process(&engine_env::process_info::ProcessInfo {blocks: &[block]});
+    }
+    let out = mix_output.borrow();
+    (out.left[0], out.right[0])
+}
+
+#[test]
+fn muting_an_entry_through_the_production_loop_removes_it_from_the_mix() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0);
+    engine.unit_changes.borrow_mut().added.push(UNIT);
+    engine.reconcile_units();
+    let (base_left, _) = render_mix_live(&mut engine, UNIT);
+    assert!((base_left - 1.251).abs() < 0.02, "both entries sum into the mix (got {base_left})");
+    set_bool(&mut engine, ENTRY_A, ENTRY_MUTE_KEY, false, true);
+    engine.reconcile_units(); // the edit must enqueue the unit; a drain that no-ops here IS the live bug
+    let (muted_left, _) = render_mix_live(&mut engine, UNIT);
+    assert!((muted_left - 0.251).abs() < 0.02, "muting A leaves only B (got {muted_left})");
+}
+
+#[test]
+fn soloing_an_entry_through_the_production_loop_keeps_only_that_entry() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0);
+    engine.unit_changes.borrow_mut().added.push(UNIT);
+    engine.reconcile_units();
+    set_bool(&mut engine, ENTRY_A, ENTRY_SOLO_KEY, false, true);
+    engine.reconcile_units();
+    let (solo_left, _) = render_mix_live(&mut engine, UNIT);
+    assert!((solo_left - 1.0).abs() < 0.02, "soloing A keeps A (~1.0), not B's ~0.25 (got {solo_left})");
+}
+
+#[test]
+fn panning_an_entry_through_the_production_loop_removes_its_right_channel() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0);
+    engine.unit_changes.borrow_mut().added.push(UNIT);
+    engine.reconcile_units();
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(ENTRY_A, vec![ENTRY_PAN_KEY]),
+        old: FieldValue::Float32(0.0), new: FieldValue::Float32(-1.0)
+    }], &engine.registry).expect("pan A hard left");
+    engine.reconcile_units();
+    let (_, pan_right) = render_mix_live(&mut engine, UNIT);
+    assert!((pan_right - 0.251).abs() < 0.02, "A drops off the right, leaving only B (got {pan_right})");
+}
+
+fn engine_with_frequency_composite() -> Engine {
+    let mut engine = engine_with_devices();
+    engine.register_effect_composite("TestComposite".to_string(), DEVICE_KIND_AUDIO_EFFECT as u8,
+        crate::Distributor::Frequency, ENTRIES_FIELD, ENTRY_INDEX_KEY, ENTRY_CHAIN_FIELD, ENTRY_LABEL_KEY,
+        ENTRY_GAIN_KEY, ENTRY_PAN_KEY, ENTRY_MUTE_KEY, ENTRY_SOLO_KEY, DRY_KEY, WET_KEY, INPUT_TAP_FIELD,
+        [CROSSOVER1_KEY, 0, 0]);
+    engine
+}
+
+fn frequency_render_graph() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook),
+            (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)),
+            (WET_KEY, FieldValue::Float32(0.0)),
+            (CROSSOVER1_KEY, FieldValue::Float32(1_000.0))
+        ]),
+        entry_box_gain(ENTRY_A, 0, "Low", 0.0),
+        entry_box_gain(ENTRY_B, 1, "High", 0.0)
+    ])
+}
+
+fn engine_with_frequency_composite_bands() -> Engine {
+    let mut engine = engine_with_devices();
+    engine.register_effect_composite("TestComposite".to_string(), DEVICE_KIND_AUDIO_EFFECT as u8,
+        crate::Distributor::Frequency, ENTRIES_FIELD, ENTRY_INDEX_KEY, ENTRY_CHAIN_FIELD, ENTRY_LABEL_KEY,
+        ENTRY_GAIN_KEY, ENTRY_PAN_KEY, ENTRY_MUTE_KEY, ENTRY_SOLO_KEY, DRY_KEY, WET_KEY, INPUT_TAP_FIELD,
+        [CROSSOVER1_KEY, CROSSOVER2_KEY, CROSSOVER3_KEY]);
+    engine
+}
+
+fn frequency_render_graph_4() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook),
+            (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)),
+            (WET_KEY, FieldValue::Float32(0.0)),
+            (CROSSOVER1_KEY, FieldValue::Float32(200.0)),
+            (CROSSOVER2_KEY, FieldValue::Float32(1_000.0)),
+            (CROSSOVER3_KEY, FieldValue::Float32(5_000.0))
+        ]),
+        entry_box_gain(ENTRY_A, 0, "Low", 0.0),
+        entry_box_gain(ENTRY_B, 1, "LowMid", 0.0),
+        entry_box_gain(ENTRY_C, 2, "HighMid", 0.0),
+        entry_box_gain(ENTRY_D, 3, "High", 0.0)
+    ])
+}
+
+// Feed a steady sine into the distributor and return the mix output's RMS relative to the input's, over the
+// settled tail. An allpass reconstruction preserves magnitude, so a band that actually carries the tone gives ~1.
+fn frequency_sine_rms_ratio(engine: &mut Engine, unit: &AudioUnitBinding, freq: f32) -> f64 {
+    let src = shared_audio_buffer();
+    composite_of(unit).set_audio_source(src.clone());
+    let block = abi::Block {index: 0, flags: abi::BlockFlags::create(true, false, false, false),
+        p0: 0.0, p1: 1.0, s0: 0, s1: engine_env::RENDER_QUANTUM as u32, bpm: 120.0};
+    let step = 2.0 * core::f32::consts::PI * freq / 48_000.0;
+    let mut phase = 0.0f32;
+    let (mut energy_in, mut energy_out) = (0.0f64, 0.0f64);
+    for round in 0..24 {
+        {
+            let mut buffer = src.borrow_mut();
+            for index in 0..engine_env::RENDER_QUANTUM {
+                let value = math::sin(phase);
+                buffer.left[index] = value;
+                buffer.right[index] = value;
+                phase += step;
+            }
+        }
+        engine.context.process(&engine_env::process_info::ProcessInfo {blocks: &[block]});
+        if round >= 12 {
+            let out = composite_of(unit).mix_output.borrow();
+            let input = src.borrow();
+            for index in 0..engine_env::RENDER_QUANTUM {
+                energy_in += (input.left[index] as f64).powi(2);
+                energy_out += (out.left[index] as f64).powi(2);
+            }
+        }
+    }
+    (energy_out / energy_in).sqrt()
+}
+
+#[test]
+fn dragging_a_low_crossover_through_the_engine_stays_bounded() {
+    let mut engine = engine_with_frequency_composite_bands();
+    engine.graph = frequency_render_graph_4();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let src = shared_audio_buffer();
+    composite_of(&unit).set_audio_source(src.clone());
+    let block = abi::Block {index: 0, flags: abi::BlockFlags::create(true, false, false, false),
+        p0: 0.0, p1: 1.0, s0: 0, s1: engine_env::RENDER_QUANTUM as u32, bpm: 120.0};
+    let mut seed = 0x9e37_79b9u32;
+    let mut current = 200.0f32;
+    let mut peak = 0.0f32;
+    for round in 0..300 {
+        {
+            let mut buffer = src.borrow_mut();
+            for index in 0..engine_env::RENDER_QUANTUM {
+                seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let value = (seed >> 8) as f32 / 8_388_608.0 - 1.0; // broadband noise (the case that blew up)
+                buffer.left[index] = value;
+                buffer.right[index] = value;
+            }
+        }
+        // Simulate a live drag of the lowest crossover down to 25 Hz by editing its field through the real graph
+        // path (the subscription applies it to the distributor exactly as the studio does).
+        let target = 200.0 - (200.0 - 25.0) * (round as f32 / 150.0).min(1.0);
+        if (target - current).abs() > 0.01 {
+            engine.graph.transaction(&[Update::Primitive {
+                address: Address::of(COMP, vec![CROSSOVER1_KEY]),
+                old: FieldValue::Float32(current), new: FieldValue::Float32(target)
+            }], &engine.registry).expect("edit crossover");
+            current = target;
+        }
+        engine.context.process(&engine_env::process_info::ProcessInfo {blocks: &[block]});
+        let out = composite_of(&unit).mix_output.borrow();
+        for index in 0..engine_env::RENDER_QUANTUM {
+            assert!(out.left[index].is_finite(), "engine produced a non-finite sample");
+            peak = peak.max(out.left[index].abs());
+        }
+    }
+    assert!(peak < 4.0, "dragging the low crossover through the engine must stay bounded (peak {peak})");
+}
+
+#[test]
+fn a_four_band_split_keeps_the_two_highest_bands_audible() {
+    for &(freq, band) in &[(8_000.0f32, "top"), (2_500.0f32, "high-mid")] {
+        let mut engine = engine_with_frequency_composite_bands();
+        engine.graph = frequency_render_graph_4();
+        let mut unit = engine.build_unit(UNIT);
+        engine.reconcile_one(&mut unit);
+        let ratio = frequency_sine_rms_ratio(&mut engine, &unit, freq);
+        assert!(ratio > 0.9, "the {band} band must pass a {freq}Hz tone (out/in RMS {ratio})");
+    }
+}
+
+#[test]
+fn a_frequency_composite_routes_dc_to_the_low_band_only() {
+    let mut engine = engine_with_frequency_composite();
+    engine.graph = frequency_render_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (left, right) = render_mix(&mut engine, &unit);
+    // DC (0 Hz) passes the lowpass band at unity and is blocked by the highpass band, so the two empty bands sum
+    // back to the input (1.0), NOT to 2.0 as a broadcast to both entries would. This is the whole point of the
+    // Linkwitz-Riley split, and it proves the Frequency distributor is wired end to end.
+    assert!((left - 1.0).abs() < 0.02, "DC reaches only the low band, summing to 1.0 (got {left})");
+    assert!((right - 1.0).abs() < 0.02, "and the same on the right (got {right})");
+}
+
+#[test]
+fn muting_an_entry_removes_it_from_the_rendered_mix() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0); // A at 0 dB (~1.0), B at -12 dB (~0.25)
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (base_left, _) = render_mix(&mut engine, &unit);
+    assert!((base_left - 1.251).abs() < 0.02, "both entries sum into the mix (got {base_left})");
+    set_bool(&mut engine, ENTRY_A, ENTRY_MUTE_KEY, false, true);
+    engine.reconcile_one(&mut unit);
+    let (muted_left, _) = render_mix(&mut engine, &unit);
+    assert!((muted_left - 0.251).abs() < 0.02, "muting A leaves only B in the mix (got {muted_left})");
+}
+
+#[test]
+fn soloing_an_entry_keeps_only_that_entry_in_the_rendered_mix() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0); // A at 0 dB (~1.0), B at -12 dB (~0.25)
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    set_bool(&mut engine, ENTRY_A, ENTRY_SOLO_KEY, false, true);
+    engine.reconcile_one(&mut unit);
+    let (solo_left, _) = render_mix(&mut engine, &unit);
+    assert!((solo_left - 1.0).abs() < 0.02,
+        "soloing A keeps A (~1.0) and silences B; a wrong-chain solo would read B's ~0.25 (got {solo_left})");
+}
+
+#[test]
+fn panning_an_entry_hard_left_removes_its_right_channel_from_the_mix() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_render_graph(0.0, -12.0);
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (_, base_right) = render_mix(&mut engine, &unit);
+    assert!((base_right - 1.251).abs() < 0.02, "both entries feed the right channel (got {base_right})");
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(ENTRY_A, vec![ENTRY_PAN_KEY]),
+        old: FieldValue::Float32(0.0), new: FieldValue::Float32(-1.0)
+    }], &engine.registry).expect("pan A hard left");
+    engine.reconcile_one(&mut unit);
+    let (pan_left, pan_right) = render_mix(&mut engine, &unit);
+    assert!((pan_left - 1.251).abs() < 0.02, "A stays full on the left (got {pan_left})");
+    assert!((pan_right - 0.251).abs() < 0.02, "A drops off the right, leaving only B (got {pan_right})");
+}
+
+#[test]
+fn disabling_a_nested_effect_bypasses_it_edge_only_keeping_its_processor() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let wired_before = composite_of(&unit).entry_wired_count(ENTRY_A).expect("entry A");
+    let disable = Update::Primitive {
+        address: Address::of(NESTED_A, vec![DEVICE_ENABLED_KEY]),
+        old: FieldValue::Boolean(true),
+        new: FieldValue::Boolean(false)
+    };
+    engine.graph.transaction(&[disable], &engine.registry).expect("disable NESTED_A");
+    engine.reconcile_one(&mut unit);
+    let binding = composite_of(&unit);
+    assert_eq!(binding.entry_chain_len(ENTRY_A), Some(1),
+        "the disabled effect is still OWNED (its processor + DSP state survive)");
+    assert!(binding.entry_wired_count(ENTRY_A).expect("entry A") < wired_before,
+        "but it is no longer WIRED: the bypass is edge-only");
+}
+
+#[test]
+fn removing_the_composite_tears_down_its_whole_subtree() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let nodes_before = engine.context.debug_counts()[0];
+    let subs_before = engine.graph.subscription_count();
+    // Detach the composite from the unit's audio chain: every entry, nested effect, node and
+    // subscription it owns must go with it — a leak here is what a stale sub / node would be.
+    let detach = Update::Pointer {
+        address: Address::of(COMP, vec![HOST_KEY]),
+        old: Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])),
+        new: None
+    };
+    engine.graph.transaction(&[detach], &engine.registry).expect("detach the composite");
+    engine.reconcile_one(&mut unit);
+    match unit.wired.as_ref().expect("wired") {
+        Wired::Leaf(chain) => assert!(chain.audio.is_empty(), "the composite left the chain"),
+        _ => panic!("expected a leaf chain")
+    }
+    assert!(engine.context.debug_counts()[0] < nodes_before, "its nodes are gone");
+    assert!(engine.graph.subscription_count() <= subs_before,
+        "and it leaked no graph subscriptions");
+}
+
+const NESTED_COMP: Uuid = [25u8; 16];
+const NESTED_ENTRY: Uuid = [26u8; 16];
+
+// Entry A's chain holds a SECOND composite instead of a plain effect, so a stack contains a stack.
+fn nested_composite_graph() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook), (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)), (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        entry_box(ENTRY_A, 0, "A"),
+        // The INNER composite lives in entry A's chain, exactly where a plain effect would.
+        graph_box(NESTED_COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(ENTRY_A, vec![ENTRY_CHAIN_FIELD])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook), (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)), (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        graph_box(NESTED_ENTRY, "TestCompositeCell", &[
+            (ENTRY_COMPOSITE_KEY, FieldValue::Pointer(Some(Address::of(NESTED_COMP, vec![ENTRIES_FIELD])))),
+            (ENTRY_CHAIN_FIELD, FieldValue::Hook),
+            (ENTRY_INDEX_KEY, FieldValue::Int32(0)),
+            (ENTRY_LABEL_KEY, FieldValue::String("inner".to_string())),
+            (ENTRY_GAIN_KEY, FieldValue::Float32(0.0)),
+            (ENTRY_MUTE_KEY, FieldValue::Boolean(false)),
+            (ENTRY_SOLO_KEY, FieldValue::Boolean(false))
+        ]),
+        graph_box(NESTED_A, "TestEffect", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(NESTED_ENTRY, vec![ENTRY_CHAIN_FIELD])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true))
+        ])
+    ])
+}
+
+#[test]
+fn a_composite_nests_inside_an_entry_of_another_composite() {
+    let mut engine = engine_with_composite();
+    engine.graph = nested_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    // "In theory, stacks can be nested indefinitely": an entry's chain is built by the SAME member machinery
+    // as any chain, so the inner stack is just a member of the outer entry — no special case anywhere.
+    let outer = composite_of(&unit);
+    assert_eq!(outer.entry_count(), 1, "the outer stack has one entry");
+    assert_eq!(outer.entry_chain_len(ENTRY_A), Some(1), "whose chain holds exactly one member");
+    let inner = outer.nested_composite(ENTRY_A, NESTED_COMP).expect("the entry's member IS a composite");
+    assert_eq!(inner.entry_count(), 1, "and the inner stack built its own entry");
+    assert_eq!(inner.entry_chain_len(NESTED_ENTRY), Some(1), "holding the leaf effect");
+    // The inner stack's own nodes are distinct from the outer's: it is a full composite, not a shortcut.
+    assert_ne!(inner.distributor_id, outer.distributor_id);
+    assert_ne!(inner.mix_id, outer.mix_id);
+}
+
+#[test]
+fn tearing_down_an_outer_composite_takes_the_nested_one_with_it() {
+    let mut engine = engine_with_composite();
+    engine.graph = nested_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let nodes_before = engine.context.debug_counts()[0];
+    let subs_before = engine.graph.subscription_count();
+    let detach = Update::Pointer {
+        address: Address::of(COMP, vec![HOST_KEY]),
+        old: Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])),
+        new: None
+    };
+    engine.graph.transaction(&[detach], &engine.registry).expect("detach the outer composite");
+    engine.reconcile_one(&mut unit);
+    // The whole cascade goes: outer nodes, its entry, the INNER composite's nodes + entry + leaf effect.
+    assert!(engine.context.debug_counts()[0] < nodes_before, "every nested node is gone");
+    assert!(engine.graph.subscription_count() <= subs_before, "and nothing in the cascade leaked a subscription");
+    // Neither composite's output nor either input tap may outlive the teardown.
+    for uuid in [COMP, NESTED_COMP] {
+        assert!(engine.output_registry.resolve(&Address::of(uuid, vec![])).is_none(), "output unregistered");
+        assert!(engine.output_registry.resolve(&Address::of(uuid, vec![INPUT_TAP_FIELD])).is_none(),
+            "input tap unregistered");
+    }
+}
+
+#[test]
+fn the_composite_input_tap_is_a_distinct_address_from_its_output() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let (distributor, mix) = {
+        let binding = composite_of(&unit);
+        (binding.distributor_id, binding.mix_id)
+    };
+    // The user's requirement: "a nested plugin with sidechain [can] pick the input of the container". The tap
+    // lives at the composite's `input` VERTEX, which is why `resolve_one_sidechain` tries the FULL target
+    // address first — a pointer at the box itself still resolves to the composite's mixed OUTPUT.
+    let tap = engine.output_registry.resolve(&Address::of(COMP, vec![INPUT_TAP_FIELD]))
+        .expect("the input tap is registered at the composite's `input` field");
+    assert_eq!(tap.processor, distributor, "the tap is produced by the DISTRIBUTOR");
+    let output = engine.output_registry.resolve(&Address::of(COMP, vec![]))
+        .expect("the composite's output is registered at its box address");
+    assert_eq!(output.processor, mix, "while the box address is the composite's mixed output");
+    assert!(!Rc::ptr_eq(&tap.buffer, &output.buffer), "input and output are different signals");
+}
+
+// Turning `dry` / `wet` / an entry's `gain` must reach the DSP cells LIVE. Reading the fields once at build
+// left every knob dead until a reload (which rebuilt the composite and re-read them) — the classic symptom.
+// The strip's own rule: sync the field into the shared Cell, which the node reads each block.
+#[test]
+fn dry_wet_and_entry_gain_reach_the_dsp_live_without_a_reload() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    assert_eq!(composite_of(&unit).dry_db(), f32::NEG_INFINITY, "the box default: dry silent");
+    assert_eq!(composite_of(&unit).wet_db(), 0.0, "and wet at unity");
+    // Turn dry fully up and wet fully out — the user's report.
+    engine.graph.transaction(&[
+        Update::Primitive {
+            address: Address::of(COMP, vec![DRY_KEY]),
+            old: FieldValue::Float32(f32::NEG_INFINITY), new: FieldValue::Float32(0.0)
+        },
+        Update::Primitive {
+            address: Address::of(COMP, vec![WET_KEY]),
+            old: FieldValue::Float32(0.0), new: FieldValue::Float32(f32::NEG_INFINITY)
+        }
+    ], &engine.registry).expect("turn the dry / wet knobs");
+    // NO reconcile, NO reload: the cells must already carry it (the node reads them every block).
+    assert_eq!(composite_of(&unit).dry_db(), 0.0, "dry reached the DSP live");
+    assert_eq!(composite_of(&unit).wet_db(), f32::NEG_INFINITY, "and so did wet");
+    // An entry's gain is a DRAG: it must land in the strip's cell without re-wiring the chain per tick.
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(ENTRY_A, vec![ENTRY_GAIN_KEY]),
+        old: FieldValue::Float32(0.0), new: FieldValue::Float32(-6.0)
+    }], &engine.registry).expect("drag the entry gain");
+    assert_eq!(composite_of(&unit).entry_gain_db(ENTRY_A), Some(-6.0), "the entry gain reached the DSP live");
+}
+
+const WET_TRACK: Uuid = [30u8; 16];
+const WET_REGION: Uuid = [31u8; 16];
+const WET_COLLECTION: Uuid = [32u8; 16];
+const WET_EVENT: Uuid = [33u8; 16];
+
+// A composite whose `wet` is targeted by a Value track — what automating the Wet knob produces.
+fn wet_automation_graph() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook), (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)), (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        entry_box(ENTRY_A, 0, "A"),
+        // The Value track targeting the composite's `wet` (key 2 is the track's `target`).
+        graph_box(WET_TRACK, "TrackBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_TRACKS_KEY])))),
+            (2, FieldValue::Pointer(None)), // target: attached LIVE by the test
+            (TRACK_TYPE_KEY, FieldValue::Int32(2)), // Value
+            (TRACK_REGIONS_KEY, FieldValue::Hook),
+            (super::TRACK_CLIPS_KEY, FieldValue::Hook),
+            (TRACK_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        graph_box(WET_REGION, "ValueRegionBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(WET_TRACK, vec![TRACK_REGIONS_KEY])))),
+            (2, FieldValue::Pointer(Some(Address::of(WET_COLLECTION, vec![2])))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Int32(3840)),
+            (12, FieldValue::Int32(0)), (13, FieldValue::Int32(3840))
+        ]),
+        graph_box(WET_COLLECTION, "ValueEventCollectionBox", &[(1, FieldValue::Hook), (2, FieldValue::Hook)]),
+        graph_box(WET_EVENT, "ValueEventBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(WET_COLLECTION, vec![1])))),
+            (10, FieldValue::Int32(0)), (13, FieldValue::Float32(0.25))
+        ])
+    ])
+}
+
+// The automation ATTACHED but with no events drawn yet — what "create automation" leaves you with. The track
+// aims at `wet` and owns a region, but its curve is empty.
+fn wet_automation_graph_without_events() -> BoxGraph {
+    BoxGraph::from_boxes(vec![
+        graph_box(UNIT, "AudioUnitBox", &[
+            (UNIT_TRACKS_KEY, FieldValue::Hook), (UNIT_MIDI_KEY, FieldValue::Hook),
+            (UNIT_INPUT_KEY, FieldValue::Hook), (UNIT_AUDIO_KEY, FieldValue::Hook)
+        ]),
+        graph_box(INSTR, "TestInstrument", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_INPUT_KEY]))))
+        ]),
+        graph_box(COMP, "TestComposite", &[
+            (HOST_KEY, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_AUDIO_KEY])))),
+            (EFFECT_INDEX_KEY, FieldValue::Int32(0)),
+            (DEVICE_ENABLED_KEY, FieldValue::Boolean(true)),
+            (ENTRIES_FIELD, FieldValue::Hook), (INPUT_TAP_FIELD, FieldValue::Hook),
+            (DRY_KEY, FieldValue::Float32(f32::NEG_INFINITY)), (WET_KEY, FieldValue::Float32(0.0))
+        ]),
+        entry_box(ENTRY_A, 0, "A"),
+        graph_box(WET_TRACK, "TrackBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(UNIT, vec![UNIT_TRACKS_KEY])))),
+            (2, FieldValue::Pointer(Some(Address::of(COMP, vec![WET_KEY])))),
+            (TRACK_TYPE_KEY, FieldValue::Int32(2)), // Value
+            (TRACK_REGIONS_KEY, FieldValue::Hook),
+            (super::TRACK_CLIPS_KEY, FieldValue::Hook),
+            (TRACK_ENABLED_KEY, FieldValue::Boolean(true))
+        ]),
+        graph_box(WET_REGION, "ValueRegionBox", &[
+            (1, FieldValue::Pointer(Some(Address::of(WET_TRACK, vec![TRACK_REGIONS_KEY])))),
+            (2, FieldValue::Pointer(Some(Address::of(WET_COLLECTION, vec![2])))),
+            (10, FieldValue::Int32(0)), (11, FieldValue::Int32(3840)),
+            (12, FieldValue::Int32(0)), (13, FieldValue::Int32(3840))
+        ]),
+        // The curve exists but is EMPTY: no ValueEventBox points at it.
+        graph_box(WET_COLLECTION, "ValueEventCollectionBox", &[(1, FieldValue::Hook), (2, FieldValue::Hook)])
+    ])
+}
+
+// Attaching automation must NOT move the control. The UI slot carries a UNIT value, so seeding it with 0.0
+// when the curve yields nothing pinned EVERY knob in openDAW to its minimum the moment automation was created
+// (`resolve` only writes the slot while the curve covers the position, so the seed was never corrected).
+// Publishing NaN says "I have no value": the UI then keeps showing the parameter's own STORAGE value, which is
+// the only side that knows the parameter's ValueMapping and can map it.
+#[test]
+fn attaching_automation_with_no_events_does_not_move_the_control() {
+    let mut engine = engine_with_composite();
+    engine.graph = wet_automation_graph_without_events();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    let published = engine.broadcasts.live_slot(COMP, &[WET_KEY], crate::broadcast::PACKAGE_FLOAT)
+        .expect("an automated parameter registers its UI slot, so a later curve value can animate the knob");
+    let value = published.borrow()[0];
+    assert!(value.is_nan(), "no curve value -> publish NaN ('keep your storage value'), NOT 0.0 (= knob min)");
+}
+
+// Automating `wet` must install the curve the MIX NODE reads. A composite is not a plugin, so it has no
+// DeviceParams — `rebind_automation`'s device visitor never reaches dry / wet, and binding them only at BUILD
+// left an attached curve driving nothing: the UI indicated the automation while the DSP ignored it.
+#[test]
+fn automating_wet_installs_the_curve_the_mix_reads() {
+    let mut engine = engine_with_composite();
+    engine.graph = wet_automation_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    assert!(!composite_of(&unit).wet_automated(), "nothing is automated before the track is aimed");
+    // ATTACH the automation live, exactly as the user does by automating the Wet knob. This is the case that
+    // broke: a RELOAD worked (build re-read the graph with the track already there), a live attach did not.
+    let attach = Update::Pointer {
+        address: Address::of(WET_TRACK, vec![2]),
+        old: None,
+        new: Some(Address::of(COMP, vec![WET_KEY]))
+    };
+    engine.graph.transaction(&[attach], &engine.registry).expect("aim the track at `wet`");
+    engine.reconcile_one(&mut unit);
+    assert!(composite_of(&unit).wet_automated(), "the curve now drives `wet` — with no reload");
+    assert!(!composite_of(&unit).dry_automated(), "and only `wet`: `dry` has no track");
+}
+
+// The entry PAN reaches the strip live (a drag), like the gain — the strip is a real ChannelStripProcessor,
+// so panning is a genuine per-entry control, not pinned to centre.
+#[test]
+fn entry_pan_reaches_the_strip_live() {
+    let mut engine = engine_with_composite();
+    engine.graph = fx_composite_graph();
+    let mut unit = engine.build_unit(UNIT);
+    engine.reconcile_one(&mut unit);
+    assert_eq!(composite_of(&unit).entry_pan(ENTRY_A), Some(0.0), "centred by default");
+    engine.graph.transaction(&[Update::Primitive {
+        address: Address::of(ENTRY_A, vec![ENTRY_PAN_KEY]),
+        old: FieldValue::Float32(0.0), new: FieldValue::Float32(-1.0)
+    }], &engine.registry).expect("pan hard left");
+    assert_eq!(composite_of(&unit).entry_pan(ENTRY_A), Some(-1.0), "the pan reached the strip live");
 }

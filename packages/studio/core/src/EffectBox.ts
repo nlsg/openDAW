@@ -1,6 +1,9 @@
 import {
     ArpeggioDeviceBox,
+    AudioEffectCompositeBox,
+    AutotuneDeviceBox,
     MaximizerDeviceBox,
+    StereoCompositeBox,
     CompressorDeviceBox,
     CrusherDeviceBox,
     DattorroReverbDeviceBox,
@@ -29,5 +32,5 @@ export type EffectBox =
     | SpielwerkDeviceBox
     | MaximizerDeviceBox | DelayDeviceBox | ReverbDeviceBox | RevampDeviceBox | StereoToolDeviceBox | TidalDeviceBox
     | ModularDeviceBox | UnknownAudioEffectDeviceBox | CompressorDeviceBox | GateDeviceBox
-    | CrusherDeviceBox | FoldDeviceBox | DattorroReverbDeviceBox | NeuralAmpDeviceBox | VocoderDeviceBox
-    | WaveshaperDeviceBox | WerkstattDeviceBox
+    | AutotuneDeviceBox | CrusherDeviceBox | FoldDeviceBox | DattorroReverbDeviceBox | NeuralAmpDeviceBox | VocoderDeviceBox
+    | WaveshaperDeviceBox | WerkstattDeviceBox | AudioEffectCompositeBox | StereoCompositeBox

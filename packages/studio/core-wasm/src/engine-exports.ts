@@ -16,6 +16,7 @@ export type EngineExports = {
     // box-type UTF-8 name is written into the input buffer (nameLen bytes) first, then its child collection's
     // host field key + the child index/routing key are passed. Mirrors device_set_box_type.
     composite_register: (nameLen: number, childrenField: number, indexKey: number, excludeKey: number, cellInstrumentField: number, cellMidiField: number, cellAudioField: number, childEnabledKey: number, childMuteKey: number, childSoloKey: number) => void
+    effect_composite_register: (nameLen: number, kind: number, distributor: number, entriesField: number, indexKey: number, chainField: number, labelKey: number, gainKey: number, panKey: number, muteKey: number, soloKey: number, dryKey: number, wetKey: number, inputTapField: number, crossover1Key: number, crossover2Key: number, crossover3Key: number) => void
     input_ptr: () => number
     input_capacity: () => number
     input_reserve: (len: number) => number // ensure the input scratch holds `len`, grow if needed, return its (current) ptr
@@ -71,7 +72,9 @@ export type EngineExports = {
     // [unit uuid 16][flags u32 LE: 1 includeAudioEffects, 2 includeSends, 4 useInstrumentOutput,
     // 8 skipChannelStrip] from the input scratch BEFORE bind; each render fills the staging at
     // `stem_output_ptr` (stem i -> planar channels 2i / 2i+1).
-    set_stem_export: (count: number) => void
+    // `metronomeStem` (TS exportConfiguration.metronome.stem) appends the metronome as ONE further pair after
+    // the unit stems; it is part of this call because it sizes the same staging allocation.
+    set_stem_export: (count: number, metronomeStem: number) => void
     stem_output_ptr: () => number
     // FROZEN units (TS EngineCommands.setFrozenAudio): `frozen_allocate` reserves the FINAL planar stereo
     // buffer (always frameCount * 2 f32); the writer fills plane 0 (and plane 1 when stereo), then attaches

@@ -21,20 +21,26 @@ export const Manuals: ReadonlyArray<Manual> = [
         type: "folder",
         label: "General",
         files: [
+            {type: "page", label: "Introduction", path: "/manuals/introduction"},
             {type: "page", label: "Audio Bus", path: "/manuals/audio-bus"},
             {type: "page", label: "Automation", path: "/manuals/automation"},
             {type: "page", label: "Browser Support", path: "/manuals/browser-support"},
             {type: "page", label: "Capture MIDI", path: "/manuals/capture-midi"},
             {type: "page", label: "Cloud Backup", path: "/manuals/cloud-backup"},
+            {type: "page", label: "Connect MIDI Device", path: "/manuals/connect-midi-device"},
+            {type: "page", label: "Education", path: "/manuals/education"},
             {type: "page", label: "Firefox MIDI", path: "/manuals/firefox-midi"},
             {type: "page", label: "Freeze AudioUnit", path: "/manuals/freeze-audiounit"},
             {type: "page", label: "Keyboard Shortcuts", path: "/manuals/keyboard-shortcuts"},
+            {type: "page", label: "Latency", path: "/manuals/latency"},
             {type: "page", label: "Live Rooms", path: "/manuals/live-rooms"},
             {type: "page", label: "Mixer", path: "/manuals/mixer"},
             {type: "page", label: "Nextcloud", path: "/manuals/nextcloud"},
+            {type: "page", label: "Open Source", path: "/manuals/open-source"},
             {type: "page", label: "Permissions", path: "/manuals/permissions"},
             {type: "page", label: "Presets", path: "/manuals/presets"},
             {type: "page", label: "Private File System", path: "/manuals/private-file-system"},
+            {type: "page", label: "Project Management", path: "/manuals/project-management"},
             {type: "page", label: "Recording", path: "/manuals/recording"},
             {type: "page", label: "Shadertoy", path: "/manuals/shadertoy"}
         ]
@@ -47,6 +53,12 @@ export const Manuals: ReadonlyArray<Manual> = [
                 type: "folder",
                 label: "Audio FX",
                 files: [
+                    {
+                        type: "page",
+                        label: "Autotune",
+                        path: "/manuals/devices/audio/autotune",
+                        icon: EffectFactories.Autotune.defaultIcon
+                    },
                     {
                         type: "page",
                         label: "Compressor",
@@ -85,6 +97,18 @@ export const Manuals: ReadonlyArray<Manual> = [
                     },
                     {
                         type: "page",
+                        label: "Frequency Split",
+                        path: "/manuals/devices/audio/frequency-split",
+                        icon: EffectFactories.FrequencySplit.defaultIcon
+                    },
+                    {
+                        type: "page",
+                        label: "FX Composite",
+                        path: "/manuals/devices/audio/effect-composite",
+                        icon: EffectFactories.AudioEffectComposite.defaultIcon
+                    },
+                    {
+                        type: "page",
                         label: "Gate",
                         path: "/manuals/devices/audio/gate",
                         icon: EffectFactories.Gate.defaultIcon
@@ -100,6 +124,12 @@ export const Manuals: ReadonlyArray<Manual> = [
                         label: "Revamp",
                         path: "/manuals/devices/audio/revamp",
                         icon: EffectFactories.Revamp.defaultIcon
+                    },
+                    {
+                        type: "page",
+                        label: "Stereo Split",
+                        path: "/manuals/devices/audio/stereo-composite",
+                        icon: EffectFactories.StereoComposite.defaultIcon
                     },
                     {
                         type: "page",

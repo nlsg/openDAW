@@ -3,6 +3,10 @@ import {
     ApparatDeviceBox,
     ArpeggioDeviceBox,
     AudioBusBox,
+    AudioEffectCompositeBox,
+    AutotuneDeviceBox,
+    FrequencySplitBox,
+    StereoCompositeBox,
     BoxVisitor,
     CompressorDeviceBox,
     CrusherDeviceBox,
@@ -35,10 +39,17 @@ import {
     ZeitgeistDeviceBox
 } from "@opendaw/studio-boxes"
 import {ArpeggioDeviceEditor} from "@/ui/devices/midi-effects/ArpeggioDeviceEditor.tsx"
+import {AudioEffectCompositeDeviceEditor} from "@/ui/devices/audio-effects/AudioEffectCompositeDeviceEditor"
+import {FrequencySplitDeviceEditor} from "@/ui/devices/audio-effects/FrequencySplit/FrequencySplitDeviceEditor"
+import {EffectFactories as CoreEffectFactories} from "@opendaw/studio-core"
 import {
     ApparatDeviceBoxAdapter,
     ArpeggioDeviceBoxAdapter,
     AudioBusBoxAdapter,
+    AudioEffectCompositeBoxAdapter,
+    AutotuneDeviceBoxAdapter,
+    FrequencySplitBoxAdapter,
+    StereoCompositeBoxAdapter,
     CompressorDeviceBoxAdapter,
     CrusherDeviceBoxAdapter,
     DattorroReverbDeviceBoxAdapter,
@@ -92,6 +103,7 @@ import {SoundfontDeviceEditor} from "@/ui/devices/instruments/SoundfontDeviceEdi
 import {MaximizerDeviceEditor} from "@/ui/devices/audio-effects/MaximizerDeviceEditor"
 import {CompressorDeviceEditor} from "@/ui/devices/audio-effects/CompressorDeviceEditor"
 import {GateDeviceEditor} from "@/ui/devices/audio-effects/GateDeviceEditor"
+import {AutotuneDeviceEditor} from "@/ui/devices/audio-effects/AutotuneDeviceEditor"
 import {CrusherDeviceEditor} from "@/ui/devices/audio-effects/CrusherDeviceEditor"
 import {FoldDeviceEditor} from "@/ui/devices/audio-effects/FoldDeviceEditor"
 import {MIDIOutputDeviceEditor} from "@/ui/devices/instruments/MIDIOutputDeviceEditor"
@@ -215,6 +227,29 @@ export namespace DeviceEditorFactory {
                                                .adapterFor(box, UnknownAudioEffectDeviceBoxAdapter)}
                                            deviceHost={deviceHost}/>
             ),
+            visitAudioEffectCompositeBox: (box: AudioEffectCompositeBox) => (
+                <AudioEffectCompositeDeviceEditor lifecycle={lifecycle}
+                                                  service={service}
+                                                  adapter={service.project.boxAdapters
+                                                      .adapterFor(box, AudioEffectCompositeBoxAdapter)}
+                                                  deviceHost={deviceHost}
+                                                  icon={CoreEffectFactories.AudioNamed.AudioEffectComposite.defaultIcon}/>
+            ),
+            visitStereoCompositeBox: (box: StereoCompositeBox) => (
+                <AudioEffectCompositeDeviceEditor lifecycle={lifecycle}
+                                                  service={service}
+                                                  adapter={service.project.boxAdapters
+                                                      .adapterFor(box, StereoCompositeBoxAdapter)}
+                                                  deviceHost={deviceHost}
+                                                  icon={CoreEffectFactories.AudioNamed.StereoComposite.defaultIcon}/>
+            ),
+            visitFrequencySplitBox: (box: FrequencySplitBox) => (
+                <FrequencySplitDeviceEditor lifecycle={lifecycle}
+                                            service={service}
+                                            adapter={service.project.boxAdapters
+                                                .adapterFor(box, FrequencySplitBoxAdapter)}
+                                            deviceHost={deviceHost}/>
+            ),
             visitStereoToolDeviceBox: (box: StereoToolDeviceBox) => (
                 <StereoToolDeviceEditor lifecycle={lifecycle}
                                         service={service}
@@ -244,6 +279,12 @@ export namespace DeviceEditorFactory {
                                    service={service}
                                    adapter={service.project.boxAdapters.adapterFor(box, TidalDeviceBoxAdapter)}
                                    deviceHost={deviceHost}/>
+            ),
+            visitAutotuneDeviceBox: (box: AutotuneDeviceBox) => (
+                <AutotuneDeviceEditor lifecycle={lifecycle}
+                                      service={service}
+                                      adapter={service.project.boxAdapters.adapterFor(box, AutotuneDeviceBoxAdapter)}
+                                      deviceHost={deviceHost}/>
             ),
             visitCrusherDeviceBox: (box: CrusherDeviceBox) => (
                 <CrusherDeviceEditor lifecycle={lifecycle}

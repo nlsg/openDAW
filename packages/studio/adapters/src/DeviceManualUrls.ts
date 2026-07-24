@@ -10,6 +10,7 @@ export namespace DeviceManualUrls {
     export const Zeitgeist = "manuals/devices/midi/zeitgeist"
 
     // Audio Effects
+    export const Autotune = "manuals/devices/audio/autotune"
     export const StereoTool = "manuals/devices/audio/stereo-tool"
     export const Delay = "manuals/devices/audio/delay"
     export const DattorroReverb = "manuals/devices/audio/dattorro-reverb"
@@ -26,6 +27,8 @@ export namespace DeviceManualUrls {
     export const Vocoder = "manuals/devices/audio/vocoder"
     export const Waveshaper = "manuals/devices/audio/waveshaper"
     export const Werkstatt = "manuals/devices/audio/werkstatt"
+    export const AudioEffectComposite = "manuals/devices/audio/effect-composite"
+    export const StereoComposite = "manuals/devices/audio/stereo-composite"
 
     // Instruments
     export const Apparat = "manuals/devices/instruments/apparat"
@@ -35,4 +38,5 @@ export namespace DeviceManualUrls {
     export const Vaporisateur = "manuals/devices/instruments/vaporisateur"
     export const MIDIOutput = "manuals/devices/instruments/midi-output"
     export const Soundfont = "manuals/devices/instruments/soundfont"
+    export const FrequencySplit = "manuals/devices/audio/frequency-split"
 }
